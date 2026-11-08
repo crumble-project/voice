@@ -1,0 +1,62 @@
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  default: all
+  disable:
+    # Needs an allowlist of every import; go.mod already pins dependencies.
+    - depguard
+    # Forces every field of library structs such as diago.Transport to be spelled out.
+    - exhaustruct
+    - exhaustruct_v5
+    # Whitespace style rules that gofumpt does not share.
+    - wsl
+    - wsl_v5
+    - nlreturn
+    # Fights the idiomatic `if err := f(); err != nil` form.
+    - noinlineerr
+    # Short names such as r, w, and ok are idiomatic Go.
+    - varnamelen
+    # Deprecated in favour of gomodguard_v2, which `default: all` already enables.
+    - gomodguard
+  settings:
+    lll:
+      line-length: 140
+    funlen:
+      lines: 80
+      statements: 50
+    cyclop:
+      max-complexity: 15
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    govet:
+      enable-all: true
+      disable:
+        # Field order follows meaning, not padding.
+        - fieldalignment
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    rules:
+      # Field names follow the OpenAI wire format.
+      - path: internal/openai/
+        linters:
+          - tagliatelle
+      - path: _test\.go
+        linters:
+          - funlen
+          - dupl
+          - goconst
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/crumble-project/crumble-voice

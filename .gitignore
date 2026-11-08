@@ -1,0 +1,21 @@
+# Build and test output.
+/bin/
+/crumble-voice
+/coverage.out
+/coverage.html
+*.test
+*.prof
+
+# Local configuration and credentials; keep the sanitized example.
+/crumble-voice*.json
+!/crumble-voice.example.json
+.env
+.env.*
+!.env.example
+
+# Locally generated caller recordings.
+/*.wav
+/*.aiff
+
+# macOS metadata.
+.DS_Store

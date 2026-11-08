@@ -1,0 +1,292 @@
+// Package call runs one phone conversation between a caller and a bot chat.
+package call
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/crumble-project/crumble-voice/internal/audio"
+	"github.com/crumble-project/crumble-voice/internal/speech"
+	"github.com/crumble-project/crumble-voice/internal/turn"
+)
+
+// Leaves room under the 4096-character synthesis limit for multi-byte text.
+const synthesisChunk = 1500
+
+// ErrMaxDuration ends a call that reached its configured length.
+var ErrMaxDuration = errors.New("call reached its maximum duration")
+
+// Bot answers one message in a bot chat, reporting progress to observer; the
+// result holds the reply's messages in order.
+type Bot interface {
+	Turn(ctx context.Context, botID, content string, observer turn.Observer) ([]string, error)
+}
+
+// Options describe one call.
+type Options struct {
+	BotID         string
+	Greeting      string
+	CallNote      string
+	HoldingPhrase string
+	HoldingDelay  time.Duration
+	TimeoutPhrase string
+	FailurePhrase string
+	TurnTimeout   time.Duration
+	MaxDuration   time.Duration
+}
+
+// Media is the call's audio as telephone PCM. Out must pace writes in real time.
+type Media struct {
+	In  io.Reader
+	Out io.Writer
+}
+
+// Services are the dependencies of a call.
+type Services struct {
+	Speech Speech
+	Bot    Bot
+	Log    *slog.Logger
+}
+
+type turnResult struct {
+	parts   []string
+	err     error
+	speaker *streamSpeaker
+	heard   time.Duration
+	timing  *turnTiming
+}
+
+// turnTiming records when each step of a turn happened, to find what makes a call slow.
+type turnTiming struct {
+	mu        sync.Mutex
+	sent      time.Time
+	accepted  time.Time
+	running   time.Time
+	firstText time.Time
+}
+
+func (t *turnTiming) mark(at *time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if at.IsZero() {
+		*at = time.Now()
+	}
+}
+
+// since returns milliseconds from sending to at, or -1 when the step never happened.
+func (t *turnTiming) since(at time.Time) int64 {
+	if at.IsZero() {
+		return -1
+	}
+
+	return at.Sub(t.sent).Milliseconds()
+}
+
+// Run holds the conversation until the caller hangs up, ctx ends, or a service fails.
+// The caller's audio is read until In returns io.EOF, which means the call ended.
+func Run(ctx context.Context, media Media, services Services, options Options) error {
+	ctx, cancel := context.WithTimeoutCause(ctx, options.MaxDuration, ErrMaxDuration)
+	defer cancel()
+
+	session, err := services.Speech.Start(ctx, media.Out, services.Log)
+	if err != nil {
+		return fmt.Errorf("start speech: %w", err)
+	}
+
+	defer session.Close()
+
+	listened := make(chan error, 1)
+
+	go func() { listened <- listen(media.In, session) }()
+
+	if options.Greeting != "" {
+		session.Greet(options.Greeting)
+	}
+
+	if services.Speech.Acknowledges() {
+		options.HoldingPhrase = ""
+	}
+
+	conversation := &conversation{
+		services: services, options: options, session: session,
+		results: make(chan turnResult, 1), first: true,
+	}
+
+	return conversation.loop(ctx, listened)
+}
+
+type conversation struct {
+	services Services
+	options  Options
+	session  Session
+	results  chan turnResult
+	queued   []string
+	heard    time.Duration
+	busy     bool
+	first    bool
+}
+
+func (c *conversation) loop(ctx context.Context, listened <-chan error) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("call ended: %w", context.Cause(ctx))
+		case err := <-listened:
+			return err
+		case err := <-c.session.Failed():
+			return err
+		case event, ok := <-c.session.Events():
+			if !ok {
+				return fmt.Errorf("hearing ended: %w", c.session.Err())
+			}
+
+			c.handle(ctx, event)
+		case result := <-c.results:
+			c.busy = false
+			c.answer(ctx, result)
+			c.next(ctx)
+		}
+	}
+}
+
+func (c *conversation) handle(ctx context.Context, event speech.Event) {
+	switch event.Kind {
+	case speech.SpeechStarted:
+		c.session.Stop()
+	case speech.Utterance:
+		if !event.Stopped.IsZero() {
+			c.heard = time.Since(event.Stopped)
+		}
+
+		c.services.Log.Debug("caller said", "chars", len(event.Text))
+		c.queued = append(c.queued, event.Text)
+		c.next(ctx)
+	default:
+	}
+}
+
+// next sends everything the caller said since the last turn as one message;
+// a bot chat runs one turn at a time.
+func (c *conversation) next(ctx context.Context) {
+	if c.busy || len(c.queued) == 0 {
+		return
+	}
+
+	content := strings.Join(c.queued, " ")
+	c.queued = nil
+
+	if c.first && c.options.CallNote != "" {
+		content = c.options.CallNote + "\n\n" + content
+	}
+
+	c.first = false
+	c.busy = true
+
+	go c.turn(ctx, content, c.heard)
+}
+
+func (c *conversation) turn(callCtx context.Context, content string, heard time.Duration) {
+	ctx, cancel := context.WithTimeout(callCtx, c.options.TurnTimeout)
+	defer cancel()
+
+	var spoke atomic.Bool
+
+	speaker := &streamSpeaker{say: func(text string) {
+		spoke.Store(true)
+		c.session.Say(text)
+	}}
+
+	holding := time.AfterFunc(c.options.HoldingDelay, func() {
+		if c.options.HoldingPhrase != "" && !spoke.Load() {
+			c.session.Say(c.options.HoldingPhrase)
+		}
+	})
+
+	timing := &turnTiming{sent: time.Now()}
+	observer := turn.Observer{
+		Accepted: func() { timing.mark(&timing.accepted) },
+		Running:  func() { timing.mark(&timing.running) },
+		Partial: func(generation int, text string) {
+			timing.mark(&timing.firstText)
+			speaker.partial(generation, text)
+		},
+	}
+
+	parts, err := c.services.Bot.Turn(ctx, c.options.BotID, content, observer)
+
+	holding.Stop()
+
+	if errors.Is(err, context.DeadlineExceeded) && callCtx.Err() == nil {
+		err = errTurnTimeout
+	}
+
+	c.results <- turnResult{parts: parts, err: err, speaker: speaker, heard: heard, timing: timing}
+}
+
+var errTurnTimeout = errors.New("the bot did not reply in time")
+
+func (c *conversation) answer(ctx context.Context, result turnResult) {
+	switch {
+	case result.err == nil:
+		c.logTiming(result)
+
+		for _, chunk := range Chunks(Speakable(result.speaker.remainder(result.parts)), synthesisChunk) {
+			c.session.Say(chunk)
+		}
+	case errors.Is(result.err, errTurnTimeout):
+		// The turn keeps running in Crumble; its reply lands in the bot chat.
+		c.services.Log.Warn("bot turn timed out", "bot", c.options.BotID)
+		c.session.Say(c.options.TimeoutPhrase)
+	case ctx.Err() != nil:
+	default:
+		c.services.Log.Error("bot turn failed", "bot", c.options.BotID, "error", result.err)
+		c.session.Say(c.options.FailurePhrase)
+	}
+}
+
+// logTiming records where a turn's time went. All but transcribe_ms count from
+// sending the message; -1 means the step was not seen.
+func (c *conversation) logTiming(result turnResult) {
+	timing := result.timing
+
+	timing.mu.Lock()
+	defer timing.mu.Unlock()
+
+	c.services.Log.Info("turn timing",
+		"transcribe_ms", result.heard.Milliseconds(),
+		"accepted_ms", timing.since(timing.accepted),
+		"running_ms", timing.since(timing.running),
+		"first_text_ms", timing.since(timing.firstText),
+		"first_sentence_ms", timing.since(result.speaker.started),
+		"reply_ms", time.Since(timing.sent).Milliseconds(),
+	)
+}
+
+func listen(in io.Reader, session Session) error {
+	frame := make([]byte, audio.FrameBytes)
+
+	for {
+		n, err := io.ReadFull(in, frame)
+		if n > 0 {
+			if writeErr := session.Write(append([]byte(nil), frame[:n]...)); writeErr != nil {
+				return fmt.Errorf("send caller audio: %w", writeErr)
+			}
+		}
+
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil
+		}
+
+		if err != nil {
+			return fmt.Errorf("read caller audio: %w", err)
+		}
+	}
+}
