@@ -47,3 +47,7 @@ Tests need no network or API keys. `internal/sipline` uses loopback ports 25060-
 - Phone messages show as typed by the owner; `call.callNote` tells the bot its reply is spoken.
 - Streaming needs a Crumble server that supports `partial=true` on the events stream.
 - OpenAI shuts down `gpt-4o-mini-tts` on 2027-01-06, so pipeline mode needs a new synthesis model before then.
+
+## License
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
