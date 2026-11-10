@@ -42,12 +42,31 @@ var (
 	ErrBinaryMessage = errors.New("unexpected binary realtime message")
 )
 
-// Server VAD settings; the silence leaves room for a short pause mid-sentence.
+// Server VAD settings the silence-based turn detection keeps fixed.
 const (
-	vadThreshold      = 0.5
-	vadPrefixPadding  = 300
-	vadSilenceSeconds = 600
+	vadThreshold     = 0.5
+	vadPrefixPadding = 300
 )
+
+// TurnDetection decides when the caller finished a turn.
+type TurnDetection struct {
+	// Semantic waits longer when the words sound unfinished; otherwise a fixed silence ends the turn.
+	Semantic bool
+	// Eagerness is "low", "medium", "high", or "auto"; only semantic turn detection uses it.
+	Eagerness string
+	// Silence ends the turn in silence-based detection.
+	Silence time.Duration
+}
+
+func (d TurnDetection) wire() turnDetection {
+	if d.Semantic {
+		return turnDetection{Type: "semantic_vad", Eagerness: d.Eagerness}
+	}
+
+	return turnDetection{
+		Type: "server_vad", Threshold: vadThreshold, PrefixPaddingMS: vadPrefixPadding, SilenceDurationMS: int(d.Silence.Milliseconds()),
+	}
+}
 
 // Transcriber opens Realtime transcription sessions.
 type Transcriber struct {
@@ -56,11 +75,12 @@ type Transcriber struct {
 	apiKey   string
 	model    string
 	language string
+	turns    TurnDetection
 }
 
 // NewTranscriber returns a transcriber for an API base such as https://api.openai.com.
-func NewTranscriber(base *url.URL, apiKey, model, language string, log *slog.Logger) *Transcriber {
-	return &Transcriber{log: log, base: base, apiKey: apiKey, model: model, language: language}
+func NewTranscriber(base *url.URL, apiKey, model, language string, turns TurnDetection, log *slog.Logger) *Transcriber {
+	return &Transcriber{log: log, base: base, apiKey: apiKey, model: model, language: language, turns: turns}
 }
 
 var _ speech.Transcriber = (*Transcriber)(nil)
@@ -85,7 +105,7 @@ func (t *Transcriber) Transcribe(ctx context.Context) (speech.Transcription, err
 		done:   make(chan struct{}),
 	}
 
-	if err := session.configure(dialCtx, t.model, t.language); err != nil {
+	if err := session.configure(dialCtx, t.model, t.language, t.turns); err != nil {
 		_ = conn.Close(websocket.StatusPolicyViolation, "configuration failed")
 
 		return nil, err
@@ -122,9 +142,10 @@ type transcriptionConfig struct {
 
 type turnDetection struct {
 	Type              string  `json:"type"`
-	Threshold         float64 `json:"threshold"`
-	PrefixPaddingMS   int     `json:"prefix_padding_ms"`
-	SilenceDurationMS int     `json:"silence_duration_ms"`
+	Threshold         float64 `json:"threshold,omitempty"`
+	PrefixPaddingMS   int     `json:"prefix_padding_ms,omitempty"`
+	SilenceDurationMS int     `json:"silence_duration_ms,omitempty"`
+	Eagerness         string  `json:"eagerness,omitempty"`
 }
 
 type noiseReduction struct {
@@ -197,7 +218,7 @@ func (s *transcription) Close() error {
 	return nil
 }
 
-func (s *transcription) configure(ctx context.Context, model, language string) error {
+func (s *transcription) configure(ctx context.Context, model, language string, turns TurnDetection) error {
 	var update sessionUpdate
 
 	update.Type = "session.update"
@@ -206,9 +227,7 @@ func (s *transcription) configure(ctx context.Context, model, language string) e
 		// The documented PCM format is 24 kHz, so the call audio is upsampled from 8 kHz.
 		Format:        inputFormat{Type: "audio/pcm", Rate: audio.TelephoneRate * audio.Factor},
 		Transcription: transcriptionConfig{Model: model, Language: language},
-		TurnDetection: turnDetection{
-			Type: "server_vad", Threshold: vadThreshold, PrefixPaddingMS: vadPrefixPadding, SilenceDurationMS: vadSilenceSeconds,
-		},
+		TurnDetection: turns.wire(),
 		// A telephone handset is a close-talking microphone.
 		NoiseReduction: noiseReduction{Type: "near_field"},
 	}

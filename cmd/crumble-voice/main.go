@@ -7,27 +7,21 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	voiceaudio "github.com/crumble-project/crumble-voice/internal/audio"
+	"github.com/crumble-project/crumble-voice/internal/bridge"
 	"github.com/crumble-project/crumble-voice/internal/call"
 	"github.com/crumble-project/crumble-voice/internal/config"
-	"github.com/crumble-project/crumble-voice/internal/control"
 	"github.com/crumble-project/crumble-voice/internal/crumble"
 	"github.com/crumble-project/crumble-voice/internal/openai"
 	"github.com/crumble-project/crumble-voice/internal/sipline"
 )
-
-const shutdownTimeout = 10 * time.Second
-
-var errBotDisabled = errors.New("bot is disabled")
 
 func main() {
 	configPath := flag.String("config", "crumble-voice.json", "path to the configuration file")
@@ -45,6 +39,15 @@ func main() {
 	defer stop()
 
 	if err := run(ctx, *configPath, log); err != nil {
+		switch {
+		case errors.Is(err, crumble.ErrUnauthorized):
+			log.Error("the server refused the voice gateway token, which was revoked or replaced: " +
+				"issue a new voice gateway token in Settings > Voice gateway and restart crumble-voice")
+		case errors.Is(err, crumble.ErrReplaced):
+			log.Error("another voice gateway connected with this token and took over: " +
+				"run one gateway per token, or issue a new voice gateway token for this one")
+		}
+
 		log.Error("crumble-voice stopped", "error", err)
 		stop()
 		os.Exit(1) //nolint:gocritic // stop already ran; nothing else is deferred.
@@ -57,17 +60,7 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 		return fmt.Errorf("load %s: %w", configPath, err)
 	}
 
-	bot := crumble.NewClient(cfg.Crumble.BaseURL, cfg.Crumble.Email, cfg.Crumble.Password, crumble.DefaultHTTPClient())
-
-	err = bot.SignIn(ctx)
-	if err != nil {
-		return fmt.Errorf("sign in to Crumble: %w", err)
-	}
-
-	names, err := checkBots(ctx, bot, cfg.Lines)
-	if err != nil {
-		return err
-	}
+	bot := crumble.NewClient(cfg.Crumble.BaseURL, cfg.Crumble.Token, crumble.DefaultHTTPClient())
 
 	var recording []byte
 	if cfg.Call.StrangerRecording != "" {
@@ -78,21 +71,15 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	}
 
 	services := call.Services{Speech: nil, Bot: bot, Log: log}
+	calls := bridge.NewCalls(bot, log)
 
 	gateway, err := sipline.New(cfg, services, sipline.Options{
 		SpeechFor:         func(voice string) call.Speech { return newSpeech(cfg.Speech, voice, log) },
-		BotNames:          names,
 		StrangerRecording: recording,
+		Calls:             calls,
 	})
 	if err != nil {
 		return fmt.Errorf("set up SIP: %w", err)
-	}
-
-	server := control.NewServer(cfg.Control.Listen.String(), control.Handler(gateway, cfg.Control.Token, log), cfg.Call.UnansweredAfter)
-
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.Control.Listen.String())
-	if err != nil {
-		return fmt.Errorf("listen for the control API: %w", err)
 	}
 
 	group, ctx := errgroup.WithContext(ctx)
@@ -100,23 +87,8 @@ func run(ctx context.Context, configPath string, log *slog.Logger) error {
 	group.Go(func() error { return gateway.Run(ctx) })
 
 	group.Go(func() error {
-		log.Info("control API listening", "address", listener.Addr().String())
-
-		if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve control API: %w", err)
-		}
-
-		return nil
-	})
-
-	group.Go(func() error {
-		<-ctx.Done()
-
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-		defer cancel()
-
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("stop control API: %w", err)
+		if err := bridge.Run(ctx, gateway, bot, calls, log); err != nil {
+			return fmt.Errorf("voice gateway events: %w", err)
 		}
 
 		return nil
@@ -141,7 +113,7 @@ func newSpeech(cfg config.Speech, voice string, log *slog.Logger) call.Speech {
 	case config.ModeRealtime:
 		model := openai.NewRealtime(cfg.BaseURL, cfg.APIKey, openai.RealtimeOptions{
 			Model: cfg.RealtimeModel, TranscriptionModel: cfg.TranscriptionModel, Language: cfg.Language,
-			Voice: voice, Style: cfg.VoiceInstructions,
+			Voice: voice, Style: cfg.VoiceInstructions, TurnDetection: turnDetection(cfg),
 		}, log)
 
 		// It never speaks by itself, so the holding phrase fills long waits.
@@ -151,8 +123,14 @@ func newSpeech(cfg config.Speech, voice string, log *slog.Logger) call.Speech {
 	speechHTTP := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	return call.Pipeline{
-		Transcriber: openai.NewTranscriber(cfg.BaseURL, cfg.APIKey, cfg.TranscriptionModel, cfg.Language, log),
+		Transcriber: openai.NewTranscriber(cfg.BaseURL, cfg.APIKey, cfg.TranscriptionModel, cfg.Language, turnDetection(cfg), log),
 		Synthesizer: openai.NewSynthesizer(cfg.BaseURL, cfg.APIKey, cfg.SynthesisModel, voice, cfg.VoiceInstructions, speechHTTP),
+	}
+}
+
+func turnDetection(cfg config.Speech) openai.TurnDetection {
+	return openai.TurnDetection{
+		Semantic: cfg.TurnDetection == config.TurnSemantic, Eagerness: cfg.Eagerness, Silence: cfg.SilenceDuration,
 	}
 }
 
@@ -163,25 +141,4 @@ func liveInstructions(cfg config.Speech) string {
 	}
 
 	return cfg.LiveInstructions + "\n\nSpeak in the language with ISO-639-1 code " + cfg.Language + "."
-}
-
-// checkBots fails at startup when a line names a missing or disabled bot, and
-// returns the bots' names by ID.
-func checkBots(ctx context.Context, client *crumble.Client, lines []config.Line) (map[string]string, error) {
-	names := map[string]string{}
-
-	for _, line := range lines {
-		agent, err := client.Agent(ctx, line.BotID)
-		if err != nil {
-			return nil, fmt.Errorf("line %s: %w", line.Username, err)
-		}
-
-		if !agent.Enabled {
-			return nil, fmt.Errorf("line %s: bot %s (%s): %w", line.Username, agent.Name, agent.ID, errBotDisabled)
-		}
-
-		names[agent.ID] = agent.Name
-	}
-
-	return names, nil
 }

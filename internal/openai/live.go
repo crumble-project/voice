@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,7 +196,8 @@ type closeSession struct {
 // Greet words the opening line as an instruction, the form OpenAI's own greeting
 // example uses; plain commentary at the start of a call may go unspoken.
 func (d *duplex) Greet(text string) error {
-	return d.Say("Greet the caller now by saying exactly: \"" + text + "\"")
+	// A bot writes the greeting, so quoting keeps a quote or newline in it from ending the string.
+	return d.Say("Greet the caller now by saying exactly: " + strconv.Quote(text))
 }
 
 // Say hands text to the model as commentary, which it speaks and may rephrase.

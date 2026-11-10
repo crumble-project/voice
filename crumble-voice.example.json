@@ -1,8 +1,7 @@
 {
   "crumble": {
     "baseUrl": "http://127.0.0.1:7337",
-    "email": "owner@example.com",
-    "passwordEnv": "CRUMBLE_PASSWORD"
+    "tokenEnv": "CRUMBLE_VOICE_GATEWAY_TOKEN"
   },
   "sip": {
     "registrar": "192.168.1.1:5060",
@@ -12,21 +11,14 @@
     "externalHost": "",
     "rtpPortStart": 20000,
     "rtpPortEnd": 20100,
-    "registerExpiry": "5m"
-  },
-  "owner": {
-    "numbers": [
-      "**610"
+    "registerExpiry": "5m",
+    "accounts": [
+      {
+        "username": "ada",
+        "passwordEnv": "SIP_PASSWORD_ADA"
+      }
     ]
   },
-  "lines": [
-    {
-      "username": "ada",
-      "passwordEnv": "SIP_PASSWORD_ADA",
-      "displayName": "Ada",
-      "botId": "REPLACE_WITH_BOT_ID"
-    }
-  ],
   "speech": {
     "mode": "pipeline",
     "provider": "openai",
@@ -39,23 +31,22 @@
     "voiceInstructions": "Speak calmly and clearly, like on a phone call.",
     "liveModel": "gpt-live-1",
     "liveInstructions": "You are the phone voice of a personal assistant. You have no knowledge of your own: never answer questions, give facts, or make promises yourself. When the caller finishes speaking, reply only with a very short acknowledgement, such as \"Mhm, one moment.\" When you receive commentary, say it to the caller as written, without adding, leaving out, or changing information. If the caller interrupts, stop and listen.",
-    "realtimeModel": "gpt-realtime-2.1-mini"
-  },
-  "control": {
-    "listen": "127.0.0.1:8790",
-    "tokenEnv": "CRUMBLE_VOICE_TOKEN"
+    "realtimeModel": "gpt-realtime-2.1-mini",
+    "turnDetection": "semantic",
+    "eagerness": "medium",
+    "silenceDuration": "600ms"
   },
   "call": {
     "answerGreeting": "Hi, this is {name}.",
     "maxDuration": "30m",
     "turnTimeout": "2m",
     "maxConcurrent": 2,
-    "callNote": "[This message comes from a phone call. Your reply is read aloud: answer briefly in plain sentences, without lists, tables, code, or links.]",
     "holdingPhrase": "One moment.",
     "holdingDelay": "3s",
     "timeoutPhrase": "This is taking longer. I'll put the answer in our chat.",
     "failurePhrase": "Sorry, something went wrong. Please try again.",
     "unansweredAfter": "30s",
-    "strangerRecording": ""
+    "strangerRecording": "",
+    "allowOutside": false
   }
 }

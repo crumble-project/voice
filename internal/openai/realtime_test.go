@@ -110,6 +110,7 @@ func TestRealtimeSession(t *testing.T) {
 	realtime := openai.NewRealtime(base, "sk-test", openai.RealtimeOptions{
 		Model: "gpt-realtime-2.1-mini", TranscriptionModel: "gpt-4o-mini-transcribe", Language: "en",
 		Voice: "marin", Style: "Speak calmly.",
+		TurnDetection: openai.TurnDetection{Semantic: true, Eagerness: "low", Silence: 600 * time.Millisecond},
 	}, slog.New(slog.DiscardHandler))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -162,11 +163,7 @@ func checkRealtimeWire(t *testing.T, result realtimeReceived) {
 
 	inner := field(t, result.update, "session")
 	input := field(t, field(t, inner, "audio"), "input")
-	turns := field(t, input, "turn_detection")
-
-	if turns["create_response"] != false || turns["interrupt_response"] != true || turns["type"] != "server_vad" {
-		t.Errorf("turn_detection = %v, want the model never to answer by itself", turns)
-	}
+	checkSemanticTurns(t, field(t, input, "turn_detection"))
 
 	if field(t, input, "format")["type"] != "audio/pcmu" || field(t, input, "transcription")["model"] != "gpt-4o-mini-transcribe" {
 		t.Errorf("input = %v", input)
@@ -189,6 +186,18 @@ func checkRealtimeWire(t *testing.T, result realtimeReceived) {
 
 	if len(result.cancels) != 1 || result.cancels[0]["type"] != "response.cancel" || result.cancels[0]["response_id"] != "resp_2" {
 		t.Errorf("cancels = %v, want resp_2 cancelled", result.cancels)
+	}
+}
+
+func checkSemanticTurns(t *testing.T, turns map[string]any) {
+	t.Helper()
+
+	if turns["create_response"] != false || turns["interrupt_response"] != true {
+		t.Errorf("turn_detection = %v, want the model never to answer by itself", turns)
+	}
+
+	if len(turns) != 4 || turns["type"] != "semantic_vad" || turns["eagerness"] != "low" {
+		t.Errorf("turn_detection = %v, want semantic_vad with no server_vad settings", turns)
 	}
 }
 
@@ -215,8 +224,9 @@ func TestRealtimeInterruptBeforeTheReplyIsNamed(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	base, _ := url.Parse(server.URL)
-	realtime := openai.NewRealtime(base, "sk-test", openai.RealtimeOptions{Model: "gpt-realtime-2.1-mini"},
-		slog.New(slog.DiscardHandler))
+	realtime := openai.NewRealtime(base, "sk-test", openai.RealtimeOptions{
+		Model: "gpt-realtime-2.1-mini", TurnDetection: openai.TurnDetection{Semantic: false, Eagerness: "", Silence: 700 * time.Millisecond},
+	}, slog.New(slog.DiscardHandler))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -248,6 +258,12 @@ func TestRealtimeInterruptBeforeTheReplyIsNamed(t *testing.T) {
 	case result := <-got:
 		if len(result.cancels) != 1 || result.cancels[0]["response_id"] != "resp_1" {
 			t.Fatalf("cancels = %v, want resp_1 cancelled", result.cancels)
+		}
+
+		turns := field(t, field(t, field(t, result.update, "session"), "audio"), "input")["turn_detection"]
+		if turns, _ := turns.(map[string]any); turns["type"] != "server_vad" || turns["silence_duration_ms"] != float64(700) ||
+			turns["eagerness"] != nil || turns["create_response"] != false {
+			t.Errorf("turn_detection = %v, want server_vad with 700 ms of silence", turns)
 		}
 	case <-ctx.Done():
 		t.Fatal("the interrupted reply was never cancelled")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -59,14 +60,18 @@ func (f *fakeSynthesizer) said() []string {
 type fakeBot struct {
 	mu       sync.Mutex
 	contents []string
+	calls    []string
 	reply    func(content string) (string, error)
 	// stream, when set, replaces reply and may report partial text.
 	stream func(content string, partial func(generation int, text string)) ([]string, error)
+	// hangUp makes every reply ask to end the call.
+	hangUp bool
 }
 
-func (f *fakeBot) Turn(_ context.Context, _, content string, observer turn.Observer) ([]string, error) {
+func (f *fakeBot) Turn(_ context.Context, _, callID, content string, observer turn.Observer) ([]string, error) {
 	f.mu.Lock()
 	f.contents = append(f.contents, content)
+	f.calls = append(f.calls, callID)
 	f.mu.Unlock()
 
 	observer.NotifyAccepted()
@@ -79,6 +84,10 @@ func (f *fakeBot) Turn(_ context.Context, _, content string, observer turn.Obser
 	reply, err := f.reply(content)
 	if err != nil {
 		return nil, err
+	}
+
+	if f.hangUp {
+		observer.NotifyHangUp()
 	}
 
 	return []string{reply}, nil
@@ -95,7 +104,7 @@ func (pacedWriter) Write(p []byte) (int, error) {
 
 func options() call.Options {
 	return call.Options{
-		BotID: "bot", Greeting: "", CallNote: "[phone]",
+		Line: "ada", BotID: "bot", CallID: "call-1", Greeting: "",
 		HoldingPhrase: "One moment.", HoldingDelay: time.Hour,
 		TimeoutPhrase: "Later in the chat.", FailurePhrase: "Something went wrong.",
 		TurnTimeout: time.Second, MaxDuration: time.Minute,
@@ -142,7 +151,7 @@ func eventually(t *testing.T, condition func() bool) {
 	}
 }
 
-func TestReplyIsSpokenAndCallNoteSentOnce(t *testing.T) {
+func TestReplyIsSpokenAndMessagesCarryTheCallID(t *testing.T) {
 	t.Parallel()
 
 	bot := &fakeBot{reply: func(string) (string, error) { return "**Hi** there", nil }}
@@ -158,8 +167,12 @@ func TestReplyIsSpokenAndCallNoteSentOnce(t *testing.T) {
 		t.Errorf("spoken = %q, want Markdown removed", got)
 	}
 
-	if bot.contents[0] != "[phone]\n\nhello" || bot.contents[1] != "again" {
-		t.Errorf("messages = %q, want the call note on the first only", bot.contents)
+	if bot.contents[0] != "hello" || bot.contents[1] != "again" {
+		t.Errorf("messages = %q, want what the caller said", bot.contents)
+	}
+
+	if bot.calls[0] != "call-1" || bot.calls[1] != "call-1" {
+		t.Errorf("call IDs = %q, want the call's ID on every message", bot.calls)
 	}
 }
 
@@ -220,6 +233,87 @@ func TestFailedTurnSpeaksFailurePhrase(t *testing.T) {
 
 	if got := synth.said()[0]; got != "Something went wrong." {
 		t.Errorf("spoken = %q", got)
+	}
+}
+
+func TestServerEndingTheCallEndsIt(t *testing.T) {
+	t.Parallel()
+
+	bot := &fakeBot{reply: func(string) (string, error) { return "", fmt.Errorf("send message: %w", turn.ErrCallEnded) }}
+	session := &fakeTranscription{events: make(chan speech.Event, 1)}
+	synth := &fakeSynthesizer{}
+	reader, writer := io.Pipe()
+
+	defer func() { _ = writer.Close() }()
+
+	session.events <- speech.Event{Kind: speech.Utterance, Text: "hello"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := call.Run(ctx, call.Media{In: reader, Out: pacedWriter{}}, call.Services{
+		Speech: call.Pipeline{Transcriber: fakeTranscriber{session: session}, Synthesizer: synth},
+		Bot:    bot,
+		Log:    slog.New(slog.DiscardHandler),
+	}, options())
+	if !errors.Is(err, turn.ErrCallEnded) {
+		t.Fatalf("Run = %v, want the call ended by the server", err)
+	}
+
+	if said := synth.said(); len(said) != 0 {
+		t.Errorf("said %q, want no failure phrase on a call the server ended", said)
+	}
+}
+
+func TestBotHangsUpAfterItsGoodbyeWasPlayed(t *testing.T) {
+	t.Parallel()
+
+	const goodbye = "Goodbye for now."
+
+	bot := &fakeBot{reply: func(string) (string, error) { return goodbye, nil }, hangUp: true}
+	session := &fakeTranscription{events: make(chan speech.Event, 1)}
+	synth := &fakeSynthesizer{}
+	out := &countingWriter{}
+	reader, writer := io.Pipe()
+
+	defer func() { _ = writer.Close() }()
+
+	session.events <- speech.Event{Kind: speech.Utterance, Text: "please hang up"}
+
+	// What the caller says after the bot hung up starts no further turn.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+
+		session.events <- speech.Event{Kind: speech.SpeechStarted}
+		session.events <- speech.Event{Kind: speech.Utterance, Text: "hello?"}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	opts := options()
+	opts.HangUpQuiet = 100 * time.Millisecond
+
+	err := call.Run(ctx, call.Media{In: reader, Out: out}, call.Services{
+		Speech: call.Pipeline{Transcriber: fakeTranscriber{session: session}, Synthesizer: synth},
+		Bot:    bot,
+		Log:    slog.New(slog.DiscardHandler),
+	}, opts)
+	if !errors.Is(err, call.ErrBotHungUp) {
+		t.Fatalf("Run = %v, want the bot's hang-up", err)
+	}
+
+	bot.mu.Lock()
+	turns := len(bot.contents)
+	bot.mu.Unlock()
+
+	if turns != 1 {
+		t.Errorf("the bot got %d turns, want only the one that hung up", turns)
+	}
+
+	// The fake synthesizer makes one frame per character.
+	if played := out.frames.Load(); played != int64(len(goodbye)) {
+		t.Errorf("played %d frames before hanging up, want the whole goodbye of %d", played, len(goodbye))
 	}
 }
 

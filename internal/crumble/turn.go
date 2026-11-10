@@ -2,7 +2,6 @@ package crumble
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -28,10 +27,10 @@ func (e *TurnError) Error() string {
 	return fmt.Sprintf("bot turn %s: %s", e.Status, e.Detail)
 }
 
-// Turn sends content to a bot chat and waits for the bot's reply, reporting its
-// progress to observer. The result holds the reply's assistant messages in order.
-func (c *Client) Turn(ctx context.Context, botID, content string, observer turn.Observer) ([]string, error) {
-	requestID := newRequestID()
+// Turn sends what the owner said on a call to a line's bot and waits for the bot's
+// reply, reporting its progress to observer. The result holds the reply's messages in order.
+func (c *Client) Turn(ctx context.Context, username, callID, content string, observer turn.Observer) ([]string, error) {
+	requestID := turn.NewID()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -44,7 +43,7 @@ func (c *Client) Turn(ctx context.Context, botID, content string, observer turn.
 	go func() {
 		first := true
 
-		streamErr <- c.Events(ctx, botID, func(snapshot Snapshot) error {
+		streamErr <- c.Events(ctx, username, func(snapshot Snapshot) error {
 			if first {
 				first = false
 
@@ -71,21 +70,22 @@ func (c *Client) Turn(ctx context.Context, botID, content string, observer turn.
 		return nil, fmt.Errorf("open chat events: %w", context.Cause(ctx))
 	}
 
-	execution, err := c.SendMessage(ctx, botID, content, requestID)
+	execution, err := c.SendSpoken(ctx, username, callID, requestID, content)
 	if err != nil {
 		return nil, err
 	}
 
 	observer.NotifyAccepted()
 
-	stream := partialStream{observer: observer, requestID: requestID}
+	// Transcript messages carry the request ID the server built, not the one sent.
+	stream := partialStream{observer: observer, requestID: execution.RequestID}
 
 	for {
 		select {
 		case snapshot := <-snapshots:
 			stream.observe(snapshot)
 
-			reply, done, err := c.settle(ctx, botID, execution.ID, requestID, snapshot)
+			reply, done, err := c.settle(ctx, username, execution.ID, snapshot, observer)
 			if done || err != nil {
 				return reply, err
 			}
@@ -134,18 +134,20 @@ func (p *partialStream) observe(snapshot Snapshot) {
 	p.observer.NotifyPartial(p.generation, snapshot.Partial)
 }
 
+// settle reads the reply by the execution, not from the snapshot, once the chat stopped running.
 func (c *Client) settle(
-	ctx context.Context, botID, executionID, requestID string, snapshot Snapshot,
+	ctx context.Context, username, executionID string, snapshot Snapshot, observer turn.Observer,
 ) ([]string, bool, error) {
 	if snapshot.Status == "running" {
 		return nil, false, nil
 	}
 
-	execution, err := c.Execution(ctx, botID, executionID)
+	spoken, err := c.SpokenExecution(ctx, username, executionID)
 	if err != nil {
 		return nil, false, err
 	}
 
+	execution := spoken.Execution
 	if !execution.Finished() {
 		return nil, false, nil
 	}
@@ -159,34 +161,22 @@ func (c *Client) settle(
 		return nil, true, &TurnError{Status: execution.Status, Detail: detail}
 	}
 
-	reply, found := snapshot.Reply(requestID)
-	if !found {
-		// The status changed between snapshots; the next snapshot carries the transcript.
-		return nil, false, nil
+	var reply []string
+
+	for _, part := range spoken.Reply {
+		if text := strings.TrimSpace(part); text != "" {
+			reply = append(reply, text)
+		}
 	}
 
-	if len(reply) == 0 {
+	if spoken.HangUp {
+		observer.NotifyHangUp()
+	}
+
+	// A bot may hang up without a goodbye.
+	if len(reply) == 0 && !spoken.HangUp {
 		return nil, true, ErrNoReply
 	}
 
 	return reply, true, nil
-}
-
-const (
-	uuidVersionMask = 0x0f
-	uuidVersion4    = 0x40
-	uuidVariantMask = 0x3f
-	uuidVariantRFC  = 0x80
-)
-
-// newRequestID returns a random version 4 UUID, the request ID format the API requires.
-func newRequestID() string {
-	var b [16]byte
-
-	_, _ = rand.Read(b[:]) // crypto/rand.Read never returns an error.
-
-	b[6] = (b[6] & uuidVersionMask) | uuidVersion4
-	b[8] = (b[8] & uuidVariantMask) | uuidVariantRFC
-
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
