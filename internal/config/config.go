@@ -27,18 +27,14 @@ import (
 type Config struct {
 	Crumble Crumble
 	SIP     SIP
-	Owner   Owner
-	Lines   []Line
 	Speech  Speech
-	Control Control
 	Call    Call
 }
 
-// Crumble is how the gateway signs in to the Crumble server as the owner.
+// Crumble is the server the gateway connects to with its voice gateway token.
 type Crumble struct {
-	BaseURL  *url.URL
-	Email    string
-	Password string
+	BaseURL *url.URL
+	Token   string
 }
 
 // SIP is the registrar and the local transport.
@@ -55,20 +51,15 @@ type SIP struct {
 	// RegistrarPort is 0 when the registrar uses the transport's default port.
 	RegistrarPort int
 	RegistrarIPs  []netip.Addr
+	// Accounts are the SIP accounts the gateway can register; the server decides which become lines.
+	Accounts []Account
 }
 
-// Owner lists the caller IDs that belong to the owner.
-type Owner struct {
-	Numbers []string
-}
-
-// Line is one SIP account on the registrar, answered by one bot.
-type Line struct {
-	Username    string
-	Password    string
-	DisplayName string
-	BotID       string
-	// Voice is the line's voice, speech.voice unless the line sets its own.
+// Account is one SIP account on the registrar.
+type Account struct {
+	Username string
+	Password string
+	// Voice is the account's voice, speech.voice unless the account sets its own.
 	Voice string
 }
 
@@ -88,6 +79,12 @@ type Speech struct {
 	LiveModel          string
 	LiveInstructions   string
 	RealtimeModel      string
+	// TurnDetection is "semantic" or "silence"; live mode has no turn detection to configure.
+	TurnDetection string
+	// Eagerness is how soon semantic turn detection ends a turn that sounds unfinished.
+	Eagerness string
+	// SilenceDuration ends a turn in silence-based turn detection.
+	SilenceDuration time.Duration
 }
 
 // NamePlaceholder in call.answerGreeting becomes the bot's name.
@@ -100,18 +97,26 @@ const (
 	ModeLive     = "live"
 )
 
-// Control is the local HTTP API that places outbound calls.
-type Control struct {
-	Listen netip.AddrPort
-	Token  string
-}
+// Turn detections.
+const (
+	TurnSemantic = "semantic"
+	TurnSilence  = "silence"
+)
+
+// Turn detection defaults for files that leave the fields out.
+const (
+	// Medium caps the wait after unfinished-sounding words at 4s; low waits up to 8s of dead air.
+	defaultEagerness       = "medium"
+	defaultSilenceDuration = 600 * time.Millisecond
+	minSilenceDuration     = 200 * time.Millisecond
+	maxSilenceDuration     = 5 * time.Second
+)
 
 // Call bounds each call.
 type Call struct {
 	MaxDuration     time.Duration
 	TurnTimeout     time.Duration
 	MaxConcurrent   int
-	CallNote        string
 	HoldingPhrase   string
 	HoldingDelay    time.Duration
 	TimeoutPhrase   string
@@ -127,67 +132,55 @@ type Call struct {
 type fileConfig struct {
 	Crumble fileCrumble `json:"crumble"`
 	SIP     fileSIP     `json:"sip"`
-	Owner   fileOwner   `json:"owner"`
-	Lines   []fileLine  `json:"lines"`
 	Speech  fileSpeech  `json:"speech"`
-	Control fileControl `json:"control"`
 	Call    fileCall    `json:"call"`
 }
 
 type fileCrumble struct {
-	BaseURL     string `json:"baseUrl"`
-	Email       string `json:"email"`
-	PasswordEnv string `json:"passwordEnv"`
+	BaseURL  string `json:"baseUrl"`
+	TokenEnv string `json:"tokenEnv"`
 }
 
 type fileSIP struct {
-	Registrar      string   `json:"registrar"`
-	Transport      string   `json:"transport"`
-	BindHost       string   `json:"bindHost"`
-	BindPort       int      `json:"bindPort"`
-	ExternalHost   string   `json:"externalHost"`
-	RTPPortStart   int      `json:"rtpPortStart"`
-	RTPPortEnd     int      `json:"rtpPortEnd"`
-	RegisterExpiry duration `json:"registerExpiry"`
+	Registrar      string        `json:"registrar"`
+	Transport      string        `json:"transport"`
+	BindHost       string        `json:"bindHost"`
+	BindPort       int           `json:"bindPort"`
+	ExternalHost   string        `json:"externalHost"`
+	RTPPortStart   int           `json:"rtpPortStart"`
+	RTPPortEnd     int           `json:"rtpPortEnd"`
+	RegisterExpiry duration      `json:"registerExpiry"`
+	Accounts       []fileAccount `json:"accounts"`
 }
 
-type fileOwner struct {
-	Numbers []string `json:"numbers"`
-}
-
-type fileLine struct {
+type fileAccount struct {
 	Username    string `json:"username"`
 	PasswordEnv string `json:"passwordEnv"`
-	DisplayName string `json:"displayName"`
-	BotID       string `json:"botId"`
 	Voice       string `json:"voice,omitempty"`
 }
 
 type fileSpeech struct {
-	Mode               string `json:"mode"`
-	Provider           string `json:"provider"`
-	APIKeyEnv          string `json:"apiKeyEnv"`
-	BaseURL            string `json:"baseUrl"`
-	TranscriptionModel string `json:"transcriptionModel"`
-	Language           string `json:"language"`
-	SynthesisModel     string `json:"synthesisModel"`
-	Voice              string `json:"voice"`
-	VoiceInstructions  string `json:"voiceInstructions"`
-	LiveModel          string `json:"liveModel"`
-	LiveInstructions   string `json:"liveInstructions"`
-	RealtimeModel      string `json:"realtimeModel"`
-}
-
-type fileControl struct {
-	Listen   string `json:"listen"`
-	TokenEnv string `json:"tokenEnv"`
+	Mode               string   `json:"mode"`
+	Provider           string   `json:"provider"`
+	APIKeyEnv          string   `json:"apiKeyEnv"`
+	BaseURL            string   `json:"baseUrl"`
+	TranscriptionModel string   `json:"transcriptionModel"`
+	Language           string   `json:"language"`
+	SynthesisModel     string   `json:"synthesisModel"`
+	Voice              string   `json:"voice"`
+	VoiceInstructions  string   `json:"voiceInstructions"`
+	LiveModel          string   `json:"liveModel"`
+	LiveInstructions   string   `json:"liveInstructions"`
+	RealtimeModel      string   `json:"realtimeModel"`
+	TurnDetection      string   `json:"turnDetection"`
+	Eagerness          string   `json:"eagerness"`
+	SilenceDuration    duration `json:"silenceDuration"`
 }
 
 type fileCall struct {
 	MaxDuration    duration `json:"maxDuration"`
 	TurnTimeout    duration `json:"turnTimeout"`
 	MaxConcurrent  int      `json:"maxConcurrent"`
-	CallNote       string   `json:"callNote"`
 	HoldingPhrase  string   `json:"holdingPhrase"`
 	HoldingDelay   duration `json:"holdingDelay"`
 	TimeoutPhrase  string   `json:"timeoutPhrase"`
@@ -218,21 +211,17 @@ func (d *duration) UnmarshalJSON(data []byte) error {
 
 const (
 	maxConfigBytes      = 1 << 20
-	minSecretLength     = 32
-	maxCallNoteChars    = 1000
 	maxPhraseChars      = 300
-	maxDisplayName      = 64
 	maxInstructions     = 4096
 	maxLiveInstructions = 16384
 	maxConcurrent       = 64
-	maxEmailLength      = 320
 )
 
 var (
-	// Telephone systems also use internal numbers such as **611, so * and # are allowed.
-	numberPattern   = regexp.MustCompile(`^\+?[0-9*#]{1,32}$`)
-	sipUserPattern  = regexp.MustCompile(`^[A-Za-z0-9._~+-]{1,64}$`)
-	botIDPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	// The server's own rule for line usernames, which are path segments in its line routes.
+	sipUserPattern = regexp.MustCompile(`^[A-Za-z0-9._~+-]{1,64}$`)
+	// A voice gateway token is the account ID, a dot, and 32 random bytes in base64url.
+	tokenPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}\.[A-Za-z0-9_-]{43}$`)
 	envNamePattern  = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
 	languagePattern = regexp.MustCompile(`^[a-z]{2}$`)
 	modelPattern    = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,100}$`)
@@ -335,10 +324,7 @@ func (v *validator) config(raw *fileConfig) *Config {
 	config := &Config{
 		Crumble: v.crumble(raw.Crumble),
 		SIP:     v.sip(raw.SIP),
-		Owner:   v.owner(raw.Owner),
-		Lines:   v.lines(raw.Lines),
 		Speech:  v.speech(raw.Speech),
-		Control: v.control(raw.Control),
 		Call:    v.call(raw.Call),
 	}
 
@@ -369,8 +355,8 @@ func Voices(mode string) []string {
 	})
 }
 
-// voices checks speech.voice and each line's voice against the mode's voices,
-// and gives lines without their own voice the default.
+// voices checks speech.voice and each account's voice against the mode's voices,
+// and gives accounts without their own voice the default.
 func (v *validator) voices(config *Config) {
 	allowed := Voices(config.Speech.Mode)
 
@@ -382,18 +368,19 @@ func (v *validator) voices(config *Config) {
 
 	check("speech.voice", config.Speech.Voice)
 
-	for i := range config.Lines {
-		if config.Lines[i].Voice == "" {
-			config.Lines[i].Voice = config.Speech.Voice
+	accounts := config.SIP.Accounts
+	for i := range accounts {
+		if accounts[i].Voice == "" {
+			accounts[i].Voice = config.Speech.Voice
 
 			continue
 		}
 
-		check("lines["+strconv.Itoa(i)+"].voice", config.Lines[i].Voice)
+		check("sip.accounts["+strconv.Itoa(i)+"].voice", accounts[i].Voice)
 	}
 }
 
-func (v *validator) secret(field, name string, minLength int) string {
+func (v *validator) secret(field, name string) string {
 	if !envNamePattern.MatchString(name) {
 		v.failf("%s: %q is not an environment variable name", field, name)
 
@@ -407,25 +394,19 @@ func (v *validator) secret(field, name string, minLength int) string {
 		return ""
 	}
 
-	if len(value) < minLength {
-		v.failf("%s: environment variable %s must hold at least %d characters", field, name, minLength)
-	}
-
 	return value
 }
 
 func (v *validator) crumble(raw fileCrumble) Crumble {
 	base := v.serviceURL("crumble.baseUrl", raw.BaseURL)
 
-	if raw.Email == "" || len(raw.Email) > maxEmailLength || !strings.Contains(raw.Email, "@") {
-		v.failf("crumble.email: must be the owner's sign-in email")
+	token := v.secret("crumble.tokenEnv", raw.TokenEnv)
+	if token != "" && !tokenPattern.MatchString(token) {
+		v.failf("crumble.tokenEnv: environment variable %s does not hold a voice gateway token; "+
+			"issue one in Settings > Voice gateway", raw.TokenEnv)
 	}
 
-	return Crumble{
-		BaseURL:  base,
-		Email:    raw.Email,
-		Password: v.secret("crumble.passwordEnv", raw.PasswordEnv, 1),
-	}
+	return Crumble{BaseURL: base, Token: token}
 }
 
 // serviceURL accepts HTTPS anywhere and plain HTTP only to a loopback or private address.
@@ -477,6 +458,7 @@ func (v *validator) sip(raw fileSIP) SIP {
 	}
 
 	result.RegistrarHost, result.RegistrarPort, result.RegistrarIPs = v.registrar(raw.Registrar)
+	result.Accounts = v.accounts(raw.Accounts)
 
 	if raw.Transport != "udp" && raw.Transport != "tcp" {
 		v.failf("sip.transport: must be udp or tcp")
@@ -556,74 +538,35 @@ func resolve(ctx context.Context, host string) ([]netip.Addr, error) {
 	return addrs, nil
 }
 
-func (v *validator) owner(raw fileOwner) Owner {
-	if len(raw.Numbers) == 0 {
-		v.failf("owner.numbers: list at least one number the owner calls from")
-	}
-
-	seen := map[string]bool{}
-
-	for i, number := range raw.Numbers {
-		if !numberPattern.MatchString(number) {
-			v.failf("owner.numbers[%d]: %q must be digits, *, or #, with an optional leading +", i, number)
-		}
-
-		if seen[number] {
-			v.failf("owner.numbers[%d]: %q is listed twice", i, number)
-		}
-
-		seen[number] = true
-	}
-
-	return Owner(raw)
-}
-
-func (v *validator) lines(raw []fileLine) []Line {
+func (v *validator) accounts(raw []fileAccount) []Account {
 	if len(raw) == 0 {
-		v.failf("lines: configure at least one line")
+		v.failf("sip.accounts: configure at least one SIP account")
 	}
 
-	lines := make([]Line, 0, len(raw))
+	accounts := make([]Account, 0, len(raw))
 	users := map[string]bool{}
-	bots := map[string]bool{}
 
-	for i, line := range raw {
-		field := "lines[" + strconv.Itoa(i) + "]"
+	for i, account := range raw {
+		field := "sip.accounts[" + strconv.Itoa(i) + "]"
 
-		if !sipUserPattern.MatchString(line.Username) {
-			v.failf("%s.username: must be 1-64 characters of letters, digits, or ._~+-", field)
+		if !sipUserPattern.MatchString(account.Username) || account.Username == "." || account.Username == ".." {
+			v.failf("%s.username: must be 1-64 characters of letters, digits, or ._~+-, and not . or ..", field)
 		}
 
-		if !botIDPattern.MatchString(line.BotID) {
-			v.failf("%s.botId: must be a Crumble bot ID", field)
+		if users[account.Username] {
+			v.failf("%s.username: %q is listed twice", field, account.Username)
 		}
 
-		if len(line.DisplayName) > maxDisplayName {
-			v.failf("%s.displayName: at most 64 characters", field)
-		}
+		users[account.Username] = true
 
-		if users[line.Username] {
-			v.failf("%s.username: %q is used by another line", field, line.Username)
-		}
-
-		// One bot chat handles one turn at a time, so a bot answers at most one line.
-		if bots[line.BotID] {
-			v.failf("%s.botId: %q already answers another line", field, line.BotID)
-		}
-
-		users[line.Username] = true
-		bots[line.BotID] = true
-
-		lines = append(lines, Line{
-			Username:    line.Username,
-			Password:    v.secret(field+".passwordEnv", line.PasswordEnv, 1),
-			DisplayName: line.DisplayName,
-			BotID:       line.BotID,
-			Voice:       line.Voice,
+		accounts = append(accounts, Account{
+			Username: account.Username,
+			Password: v.secret(field+".passwordEnv", account.PasswordEnv),
+			Voice:    account.Voice,
 		})
 	}
 
-	return lines
+	return accounts
 }
 
 func (v *validator) speech(raw fileSpeech) Speech {
@@ -663,10 +606,12 @@ func (v *validator) speech(raw fileSpeech) Speech {
 		v.failf("speech.liveInstructions: at most %d characters", maxLiveInstructions)
 	}
 
+	turns, eagerness, silence := v.turnDetection(raw)
+
 	return Speech{
 		Mode:               raw.Mode,
 		Provider:           raw.Provider,
-		APIKey:             v.secret("speech.apiKeyEnv", raw.APIKeyEnv, 1),
+		APIKey:             v.secret("speech.apiKeyEnv", raw.APIKeyEnv),
 		BaseURL:            v.serviceURL("speech.baseUrl", raw.BaseURL),
 		TranscriptionModel: raw.TranscriptionModel,
 		Language:           raw.Language,
@@ -676,7 +621,42 @@ func (v *validator) speech(raw fileSpeech) Speech {
 		LiveModel:          raw.LiveModel,
 		LiveInstructions:   raw.LiveInstructions,
 		RealtimeModel:      raw.RealtimeModel,
+		TurnDetection:      turns,
+		Eagerness:          eagerness,
+		SilenceDuration:    silence,
 	}
+}
+
+// turnDetection fills in the defaults and checks the values in every mode, so
+// switching speech.mode or speech.turnDetection changes one field.
+func (v *validator) turnDetection(raw fileSpeech) (string, string, time.Duration) {
+	turns, eagerness, silence := raw.TurnDetection, raw.Eagerness, time.Duration(raw.SilenceDuration)
+
+	if turns == "" {
+		turns = TurnSemantic
+	}
+
+	if eagerness == "" {
+		eagerness = defaultEagerness
+	}
+
+	if silence == 0 {
+		silence = defaultSilenceDuration
+	}
+
+	if turns != TurnSemantic && turns != TurnSilence {
+		v.failf("speech.turnDetection: must be %q or %q", TurnSemantic, TurnSilence)
+	}
+
+	if !slices.Contains([]string{"low", "medium", "high", "auto"}, eagerness) {
+		v.failf("speech.eagerness: must be low, medium, high, or auto")
+	}
+
+	if silence < minSilenceDuration || silence > maxSilenceDuration || silence%time.Millisecond != 0 {
+		v.failf("speech.silenceDuration: must be whole milliseconds between %v and %v", minSilenceDuration, maxSilenceDuration)
+	}
+
+	return turns, eagerness, silence
 }
 
 // speechMode returns the model fields the chosen mode needs. Only the active
@@ -704,26 +684,11 @@ func (v *validator) speechMode(raw fileSpeech) map[string]string {
 	return required
 }
 
-func (v *validator) control(raw fileControl) Control {
-	listen, err := netip.ParseAddrPort(raw.Listen)
-	if err != nil {
-		v.failf("control.listen: must be ip:port: %v", err)
-	} else if !listen.Addr().IsLoopback() && !listen.Addr().IsPrivate() {
-		v.failf("control.listen: must be a loopback or private address; the API has no TLS")
-	}
-
-	return Control{
-		Listen: listen,
-		Token:  v.secret("control.tokenEnv", raw.TokenEnv, minSecretLength),
-	}
-}
-
 func (v *validator) call(raw fileCall) Call {
 	result := Call{
 		MaxDuration:       time.Duration(raw.MaxDuration),
 		TurnTimeout:       time.Duration(raw.TurnTimeout),
 		MaxConcurrent:     raw.MaxConcurrent,
-		CallNote:          raw.CallNote,
 		HoldingPhrase:     raw.HoldingPhrase,
 		HoldingDelay:      time.Duration(raw.HoldingDelay),
 		TimeoutPhrase:     raw.TimeoutPhrase,
@@ -755,10 +720,6 @@ func (v *validator) call(raw fileCall) Call {
 
 	v.phrases(result)
 
-	if len(result.CallNote) > maxCallNoteChars {
-		v.failf("call.callNote: at most %d characters", maxCallNoteChars)
-	}
-
 	return result
 }
 
@@ -786,9 +747,4 @@ func (v *validator) phrases(result Call) {
 			v.failf("%s: required, at most %d characters", field, maxPhraseChars)
 		}
 	}
-}
-
-// IsOwner reports whether a caller ID belongs to the owner. The match is exact.
-func (o Owner) IsOwner(number string) bool {
-	return slices.Contains(o.Numbers, number)
 }

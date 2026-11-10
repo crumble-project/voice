@@ -20,26 +20,40 @@ import (
 // Leaves room under the 4096-character synthesis limit for multi-byte text.
 const synthesisChunk = 1500
 
-// ErrMaxDuration ends a call that reached its configured length.
-var ErrMaxDuration = errors.New("call reached its maximum duration")
+var (
+	// ErrMaxDuration ends a call that reached its configured length.
+	ErrMaxDuration = errors.New("call reached its maximum duration")
+	// ErrBotHungUp ends a call the bot asked to end, once its goodbye was said.
+	ErrBotHungUp = errors.New("the bot hung up")
+)
 
-// Bot answers one message in a bot chat, reporting progress to observer; the
-// result holds the reply's messages in order.
+// Speech has no end signal shared by every speech mode, so a goodbye counts as said
+// once no audio went out for this long. It covers the wait for the first audio too.
+const defaultHangUpQuiet = 3 * time.Second
+
+// Bot answers one spoken message on a line's bot chat, reporting progress to
+// observer; the result holds the reply's messages in order.
 type Bot interface {
-	Turn(ctx context.Context, botID, content string, observer turn.Observer) ([]string, error)
+	Turn(ctx context.Context, username, callID, content string, observer turn.Observer) ([]string, error)
 }
 
 // Options describe one call.
 type Options struct {
-	BotID         string
+	// Line is the SIP username of the line the call is on.
+	Line string
+	// BotID names the line's bot in logs.
+	BotID string
+	// CallID groups the call's spoken messages on the server.
+	CallID        string
 	Greeting      string
-	CallNote      string
 	HoldingPhrase string
 	HoldingDelay  time.Duration
 	TimeoutPhrase string
 	FailurePhrase string
 	TurnTimeout   time.Duration
 	MaxDuration   time.Duration
+	// HangUpQuiet is how long no audio must go out before a call the bot ends hangs up; zero means 3 seconds.
+	HangUpQuiet time.Duration
 }
 
 // Media is the call's audio as telephone PCM. Out must pace writes in real time.
@@ -55,9 +69,24 @@ type Services struct {
 	Log    *slog.Logger
 }
 
+// quietWriter notes when audio last went out.
+type quietWriter struct {
+	out  io.Writer
+	last atomic.Int64
+}
+
+func (w *quietWriter) Write(pcm []byte) (int, error) {
+	n, err := w.out.Write(pcm)
+	w.last.Store(time.Now().UnixNano())
+
+	//nolint:wrapcheck // The writer only observes; callers wrap the error.
+	return n, err
+}
+
 type turnResult struct {
 	parts   []string
 	err     error
+	hangUp  bool
 	speaker *streamSpeaker
 	heard   time.Duration
 	timing  *turnTiming
@@ -96,7 +125,13 @@ func Run(ctx context.Context, media Media, services Services, options Options) e
 	ctx, cancel := context.WithTimeoutCause(ctx, options.MaxDuration, ErrMaxDuration)
 	defer cancel()
 
-	session, err := services.Speech.Start(ctx, media.Out, services.Log)
+	if options.HangUpQuiet == 0 {
+		options.HangUpQuiet = defaultHangUpQuiet
+	}
+
+	out := &quietWriter{out: media.Out, last: atomic.Int64{}}
+
+	session, err := services.Speech.Start(ctx, out, services.Log)
 	if err != nil {
 		return fmt.Errorf("start speech: %w", err)
 	}
@@ -116,8 +151,8 @@ func Run(ctx context.Context, media Media, services Services, options Options) e
 	}
 
 	conversation := &conversation{
-		services: services, options: options, session: session,
-		results: make(chan turnResult, 1), first: true,
+		services: services, options: options, session: session, out: out,
+		results: make(chan turnResult, 1),
 	}
 
 	return conversation.loop(ctx, listened)
@@ -127,11 +162,14 @@ type conversation struct {
 	services Services
 	options  Options
 	session  Session
+	out      *quietWriter
 	results  chan turnResult
-	queued   []string
-	heard    time.Duration
-	busy     bool
-	first    bool
+	// leaving fires when a call the bot ends may have gone quiet; leftAt is when the bot asked.
+	leaving <-chan time.Time
+	leftAt  time.Time
+	queued  []string
+	heard   time.Duration
+	busy    bool
 }
 
 func (c *conversation) loop(ctx context.Context, listened <-chan error) error {
@@ -150,9 +188,30 @@ func (c *conversation) loop(ctx context.Context, listened <-chan error) error {
 
 			c.handle(ctx, event)
 		case result := <-c.results:
+			if errors.Is(result.err, turn.ErrCallEnded) {
+				return fmt.Errorf("bot turn: %w", result.err)
+			}
+
 			c.busy = false
 			c.answer(ctx, result)
+
+			if result.hangUp && result.err == nil && c.leaving == nil {
+				c.leaving, c.leftAt = time.After(c.options.HangUpQuiet), time.Now()
+			}
+
 			c.next(ctx)
+		case <-c.leaving:
+			quietSince := c.leftAt
+			if last := time.Unix(0, c.out.last.Load()); last.After(quietSince) {
+				quietSince = last
+			}
+
+			quiet := time.Since(quietSince)
+			if quiet >= c.options.HangUpQuiet {
+				return ErrBotHungUp
+			}
+
+			c.leaving = time.After(c.options.HangUpQuiet - quiet)
 		}
 	}
 }
@@ -182,12 +241,6 @@ func (c *conversation) next(ctx context.Context) {
 
 	content := strings.Join(c.queued, " ")
 	c.queued = nil
-
-	if c.first && c.options.CallNote != "" {
-		content = c.options.CallNote + "\n\n" + content
-	}
-
-	c.first = false
 	c.busy = true
 
 	go c.turn(ctx, content, c.heard)
@@ -197,7 +250,7 @@ func (c *conversation) turn(callCtx context.Context, content string, heard time.
 	ctx, cancel := context.WithTimeout(callCtx, c.options.TurnTimeout)
 	defer cancel()
 
-	var spoke atomic.Bool
+	var spoke, hangUp atomic.Bool
 
 	speaker := &streamSpeaker{say: func(text string) {
 		spoke.Store(true)
@@ -218,9 +271,10 @@ func (c *conversation) turn(callCtx context.Context, content string, heard time.
 			timing.mark(&timing.firstText)
 			speaker.partial(generation, text)
 		},
+		HangUp: func() { hangUp.Store(true) },
 	}
 
-	parts, err := c.services.Bot.Turn(ctx, c.options.BotID, content, observer)
+	parts, err := c.services.Bot.Turn(ctx, c.options.Line, c.options.CallID, content, observer)
 
 	holding.Stop()
 
@@ -228,7 +282,7 @@ func (c *conversation) turn(callCtx context.Context, content string, heard time.
 		err = errTurnTimeout
 	}
 
-	c.results <- turnResult{parts: parts, err: err, speaker: speaker, heard: heard, timing: timing}
+	c.results <- turnResult{parts: parts, err: err, hangUp: hangUp.Load(), speaker: speaker, heard: heard, timing: timing}
 }
 
 var errTurnTimeout = errors.New("the bot did not reply in time")

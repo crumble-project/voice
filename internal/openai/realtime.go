@@ -25,6 +25,7 @@ type Realtime struct {
 	language      string
 	voice         string
 	style         string
+	turns         TurnDetection
 }
 
 // RealtimeOptions configure a Realtime client.
@@ -34,14 +35,15 @@ type RealtimeOptions struct {
 	Language           string
 	Voice              string
 	// Style is how to speak, such as "calmly and clearly"; the words always come from the bot.
-	Style string
+	Style         string
+	TurnDetection TurnDetection
 }
 
 // NewRealtime returns a Realtime client for an API base such as https://api.openai.com.
 func NewRealtime(base *url.URL, apiKey string, options RealtimeOptions, log *slog.Logger) *Realtime {
 	return &Realtime{
 		log: log, base: base, apiKey: apiKey, model: options.Model, transcription: options.TranscriptionModel,
-		language: options.Language, voice: options.Voice, style: options.Style,
+		language: options.Language, voice: options.Voice, style: options.Style, turns: options.TurnDetection,
 	}
 }
 
@@ -76,10 +78,8 @@ type audioFormat struct {
 }
 
 type realtimeTurns struct {
-	Type              string  `json:"type"`
-	Threshold         float64 `json:"threshold"`
-	PrefixPaddingMS   int     `json:"prefix_padding_ms"`
-	SilenceDurationMS int     `json:"silence_duration_ms"`
+	turnDetection
+
 	// The model must never answer by itself: every word it says comes from the bot.
 	CreateResponse bool `json:"create_response"`
 	// The server cancels what the model is saying when the caller starts talking.
@@ -121,8 +121,7 @@ func (r *Realtime) Open(ctx context.Context) (speech.Duplex, error) {
 	update.Session.Audio.Input.Format = audioFormat{Type: formatPCMU}
 	update.Session.Audio.Input.Transcription = transcriptionConfig{Model: r.transcription, Language: r.language}
 	update.Session.Audio.Input.TurnDetection = realtimeTurns{
-		Type: "server_vad", Threshold: vadThreshold, PrefixPaddingMS: vadPrefixPadding, SilenceDurationMS: vadSilenceSeconds,
-		CreateResponse: false, InterruptResponse: true,
+		turnDetection: r.turns.wire(), CreateResponse: false, InterruptResponse: true,
 	}
 	update.Session.Audio.Output.Format = audioFormat{Type: formatPCMU}
 	update.Session.Audio.Output.Voice = r.voice

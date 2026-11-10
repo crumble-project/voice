@@ -12,35 +12,34 @@ import (
 )
 
 const validConfig = `{
-  "crumble": {"baseUrl": "http://127.0.0.1:3000", "email": "owner@example.com", "passwordEnv": "CRUMBLE_PASSWORD"},
+  "crumble": {"baseUrl": "http://127.0.0.1:3000", "tokenEnv": "CRUMBLE_VOICE_GATEWAY_TOKEN"},
   "sip": {
     "registrar": "192.168.1.1:5060", "transport": "udp", "bindHost": "0.0.0.0", "bindPort": 5070,
-    "externalHost": "", "rtpPortStart": 20000, "rtpPortEnd": 20100, "registerExpiry": "5m"
+    "externalHost": "", "rtpPortStart": 20000, "rtpPortEnd": 20100, "registerExpiry": "5m",
+    "accounts": [{"username": "ada", "passwordEnv": "SIP_PASSWORD_ADA"}]
   },
-  "owner": {"numbers": ["**610", "+4930123456"]},
-  "lines": [{"username": "ada", "passwordEnv": "SIP_PASSWORD_ADA", "displayName": "Ada", "botId": "bot_ada"}],
   "speech": {
     "mode": "pipeline", "provider": "openai", "apiKeyEnv": "OPENAI_API_KEY", "baseUrl": "https://api.openai.com",
     "transcriptionModel": "gpt-4o-transcribe", "language": "de",
     "synthesisModel": "gpt-4o-mini-tts", "voice": "marin", "voiceInstructions": "",
     "liveModel": "", "liveInstructions": "", "realtimeModel": ""
   },
-  "control": {"listen": "127.0.0.1:8790", "tokenEnv": "CRUMBLE_VOICE_TOKEN"},
   "call": {
     "maxDuration": "30m", "turnTimeout": "2m", "maxConcurrent": 2,
-    "callNote": "This message comes from a phone call.", "holdingPhrase": "One moment.", "holdingDelay": "3s",
+    "holdingPhrase": "One moment.", "holdingDelay": "3s",
     "timeoutPhrase": "That takes longer; the answer will be in the chat.", "failurePhrase": "Something went wrong.",
     "unansweredAfter": "30s", "answerGreeting": "Hi, this is {name}.",
     "strangerRecording": ""
   }
 }`
 
+const voiceToken = "acct_1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 func environment(overrides map[string]string) config.Environment {
 	values := map[string]string{
-		"CRUMBLE_PASSWORD":    "correct horse battery staple",
-		"SIP_PASSWORD_ADA":    "line-secret",
-		"OPENAI_API_KEY":      "sk-test",
-		"CRUMBLE_VOICE_TOKEN": strings.Repeat("t", 32),
+		"CRUMBLE_VOICE_GATEWAY_TOKEN": voiceToken,
+		"SIP_PASSWORD_ADA":            "line-secret",
+		"OPENAI_API_KEY":              "sk-test",
 	}
 
 	for name, value := range overrides {
@@ -70,20 +69,20 @@ func TestParseValid(t *testing.T) {
 		t.Errorf("registrar = %s:%d", cfg.SIP.RegistrarHost, cfg.SIP.RegistrarPort)
 	}
 
-	if cfg.Lines[0].Password != "line-secret" {
-		t.Errorf("line password not read from the environment")
+	if cfg.SIP.Accounts[0].Password != "line-secret" {
+		t.Errorf("SIP account password not read from the environment")
+	}
+
+	if cfg.Crumble.Token != voiceToken {
+		t.Errorf("voice gateway token not read from the environment")
 	}
 
 	if cfg.Call.TurnTimeout != 2*time.Minute {
 		t.Errorf("turnTimeout = %v", cfg.Call.TurnTimeout)
 	}
 
-	if cfg.Lines[0].Voice != "marin" {
-		t.Errorf("a line without its own voice uses speech.voice, got %q", cfg.Lines[0].Voice)
-	}
-
-	if !cfg.Owner.IsOwner("**610") || cfg.Owner.IsOwner("610") {
-		t.Errorf("owner numbers must match exactly")
+	if cfg.SIP.Accounts[0].Voice != "marin" {
+		t.Errorf("an account without its own voice uses speech.voice, got %q", cfg.SIP.Accounts[0].Voice)
 	}
 }
 
@@ -134,6 +133,32 @@ func TestParseRealtimeMode(t *testing.T) {
 	}
 }
 
+func TestParseTurnDetection(t *testing.T) {
+	t.Parallel()
+
+	// A file written before turn detection was configurable gets semantic turn detection.
+	cfg, err := config.Parse(context.Background(), []byte(validConfig), environment(nil))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if s := cfg.Speech; s.TurnDetection != config.TurnSemantic || s.Eagerness != "medium" || s.SilenceDuration != 600*time.Millisecond {
+		t.Errorf("defaults = %q, %q, %v", s.TurnDetection, s.Eagerness, s.SilenceDuration)
+	}
+
+	data := strings.Replace(validConfig, `"realtimeModel": ""`,
+		`"realtimeModel": "", "turnDetection": "silence", "eagerness": "low", "silenceDuration": "1.2s"`, 1)
+
+	cfg, err = config.Parse(context.Background(), []byte(data), environment(nil))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if s := cfg.Speech; s.TurnDetection != config.TurnSilence || s.Eagerness != "low" || s.SilenceDuration != 1200*time.Millisecond {
+		t.Errorf("speech = %q, %q, %v", s.TurnDetection, s.Eagerness, s.SilenceDuration)
+	}
+}
+
 func TestLoadResolvesTheRecordingNextToTheConfig(t *testing.T) {
 	t.Parallel()
 
@@ -166,8 +191,32 @@ func TestParseRejects(t *testing.T) {
 	}{
 		{
 			name:    "unknown field",
-			edit:    func(s string) string { return strings.Replace(s, `"owner": {`, `"owner": {"pin": "1", `, 1) },
+			edit:    func(s string) string { return strings.Replace(s, `"crumble": {`, `"crumble": {"pin": "1", `, 1) },
 			message: `unknown field "pin"`,
+		},
+		{
+			name: "an old config with lines",
+			edit: func(s string) string {
+				return strings.Replace(s, `"speech": {`, `"lines": [], "speech": {`, 1)
+			},
+			message: `unknown field "lines"`,
+		},
+		{
+			name:    "a password instead of a voice gateway token",
+			env:     map[string]string{"CRUMBLE_VOICE_GATEWAY_TOKEN": "correct horse battery staple"},
+			message: "does not hold a voice gateway token",
+		},
+		{
+			name:    "no voice gateway token",
+			env:     map[string]string{"CRUMBLE_VOICE_GATEWAY_TOKEN": ""},
+			message: "CRUMBLE_VOICE_GATEWAY_TOKEN is not set",
+		},
+		{
+			name: "no SIP accounts",
+			edit: func(s string) string {
+				return strings.Replace(s, `{"username": "ada", "passwordEnv": "SIP_PASSWORD_ADA"}`, "", 1)
+			},
+			message: "configure at least one SIP account",
 		},
 		{
 			name:    "missing secret",
@@ -175,27 +224,23 @@ func TestParseRejects(t *testing.T) {
 			message: "OPENAI_API_KEY is not set",
 		},
 		{
-			name:    "short control token",
-			env:     map[string]string{"CRUMBLE_VOICE_TOKEN": "short"},
-			message: "at least 32 characters",
-		},
-		{
 			name:    "plain http to a public host",
 			edit:    func(s string) string { return strings.Replace(s, "http://127.0.0.1:3000", "http://example.com", 1) },
 			message: "plain http is only allowed",
 		},
 		{
-			name:    "public control address",
-			edit:    func(s string) string { return strings.Replace(s, "127.0.0.1:8790", "8.8.8.8:8790", 1) },
-			message: "control.listen",
+			name: "an old config with the control API",
+			edit: func(s string) string {
+				return strings.Replace(s, `"call": {`, `"control": {"listen": "127.0.0.1:8790", "tokenEnv": "X"}, "call": {`, 1)
+			},
+			message: `unknown field "control"`,
 		},
 		{
-			name: "two lines for one bot",
+			name: "one SIP account twice",
 			edit: func(s string) string {
-				return strings.Replace(s, `"lines": [`,
-					`"lines": [{"username": "bea", "passwordEnv": "SIP_PASSWORD_ADA", "displayName": "", "botId": "bot_ada"}, `, 1)
+				return strings.Replace(s, `"accounts": [`, `"accounts": [{"username": "ada", "passwordEnv": "SIP_PASSWORD_ADA"}, `, 1)
 			},
-			message: "already answers another line",
+			message: `"ada" is listed twice`,
 		},
 		{
 			name:    "unknown speech mode",
@@ -215,9 +260,30 @@ func TestParseRejects(t *testing.T) {
 		{
 			name: "live-only voice in pipeline mode",
 			edit: func(s string) string {
-				return strings.Replace(s, `"botId": "bot_ada"`, `"botId": "bot_ada", "voice": "quartz"`, 1)
+				return strings.Replace(s, `"passwordEnv": "SIP_PASSWORD_ADA"`, `"passwordEnv": "SIP_PASSWORD_ADA", "voice": "quartz"`, 1)
 			},
-			message: `lines[0].voice: "quartz" is not a pipeline voice`,
+			message: `sip.accounts[0].voice: "quartz" is not a pipeline voice`,
+		},
+		{
+			name: "unknown turn detection",
+			edit: func(s string) string {
+				return strings.Replace(s, `"realtimeModel": ""`, `"realtimeModel": "", "turnDetection": "vad"`, 1)
+			},
+			message: `speech.turnDetection: must be "semantic" or "silence"`,
+		},
+		{
+			name: "unknown eagerness",
+			edit: func(s string) string {
+				return strings.Replace(s, `"realtimeModel": ""`, `"realtimeModel": "", "eagerness": "lazy"`, 1)
+			},
+			message: "speech.eagerness: must be low, medium, high, or auto",
+		},
+		{
+			name: "silence too short",
+			edit: func(s string) string {
+				return strings.Replace(s, `"realtimeModel": ""`, `"realtimeModel": "", "silenceDuration": "100ms"`, 1)
+			},
+			message: "speech.silenceDuration: must be whole milliseconds between 200ms and 5s",
 		},
 		{
 			name:    "unknown placeholder",

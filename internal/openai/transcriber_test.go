@@ -100,7 +100,8 @@ func TestTranscriptionSession(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	base, _ := url.Parse(server.URL)
-	transcriber := openai.NewTranscriber(base, "sk-test", "gpt-4o-transcribe", "de", slog.New(slog.DiscardHandler))
+	semantic := openai.TurnDetection{Semantic: true, Eagerness: "medium", Silence: 600 * time.Millisecond}
+	transcriber := openai.NewTranscriber(base, "sk-test", "gpt-4o-transcribe", "de", semantic, slog.New(slog.DiscardHandler))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -127,7 +128,12 @@ func TestTranscriptionSession(t *testing.T) {
 		t.Errorf("query = %q, auth = %q", result.query, result.auth)
 	}
 
-	format := field(t, field(t, field(t, field(t, result.update, "session"), "audio"), "input"), "format")
+	input := field(t, field(t, field(t, result.update, "session"), "audio"), "input")
+	format := field(t, input, "format")
+
+	if turns := field(t, input, "turn_detection"); len(turns) != 2 || turns["type"] != "semantic_vad" || turns["eagerness"] != "medium" {
+		t.Errorf("turn_detection = %v, want semantic_vad with eagerness only", turns)
+	}
 
 	if result.update["type"] != "session.update" || format["type"] != "audio/pcm" || format["rate"] != float64(24000) {
 		t.Errorf("update = %v", result.update)
@@ -136,6 +142,45 @@ func TestTranscriptionSession(t *testing.T) {
 	// 20 ms at 8 kHz becomes 20 ms at 24 kHz.
 	if len(result.audio) != audio.FrameBytes*audio.Factor {
 		t.Errorf("appended %d bytes, want %d", len(result.audio), audio.FrameBytes*audio.Factor)
+	}
+}
+
+func TestTranscriptionSilenceTurnDetection(t *testing.T) {
+	t.Parallel()
+
+	got := make(chan received, 1)
+	server := realtimeServer(t, got)
+	t.Cleanup(server.Close)
+
+	base, _ := url.Parse(server.URL)
+	silence := openai.TurnDetection{Semantic: false, Eagerness: "medium", Silence: 900 * time.Millisecond}
+	transcriber := openai.NewTranscriber(base, "sk-test", "gpt-4o-transcribe", "", silence, slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := transcriber.Transcribe(ctx)
+	if err != nil {
+		t.Fatalf("Transcribe: %v", err)
+	}
+
+	defer func() { _ = session.Close() }()
+
+	if err := session.Write(make([]byte, audio.FrameBytes)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	turns := field(t, field(t, field(t, field(t, (<-got).update, "session"), "audio"), "input"), "turn_detection")
+
+	want := map[string]any{"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": float64(300), "silence_duration_ms": float64(900)}
+	if len(turns) != len(want) {
+		t.Fatalf("turn_detection = %v, want %v", turns, want)
+	}
+
+	for name, value := range want {
+		if turns[name] != value {
+			t.Errorf("turn_detection.%s = %v, want %v", name, turns[name], value)
+		}
 	}
 }
 
@@ -192,7 +237,7 @@ func TestAudioBurstIsBatched(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	base, _ := url.Parse(server.URL)
-	transcriber := openai.NewTranscriber(base, "sk-test", "gpt-4o-transcribe", "", slog.New(slog.DiscardHandler))
+	transcriber := openai.NewTranscriber(base, "sk-test", "gpt-4o-transcribe", "", openai.TurnDetection{}, slog.New(slog.DiscardHandler))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
