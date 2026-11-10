@@ -44,21 +44,25 @@ const (
 	// The owner's phone answers, hears the greeting, and waits for the gateway to hang up.
 	stays    = "**630"
 	stranger = "999"
-	callA    = "0b4d2a51-7c1e-4f3a-9d2b-6e8f1a2c3d4e"
-	callB    = "1c5e3b62-8d2f-4a4b-8e3c-7f9a2b3d4e5f"
-	callC    = "2d6f4c73-9e3a-4b5c-9f4d-8a0b3c4d5e6f"
-	callD    = "3e7a5d84-af4b-4c6d-8a5e-9b1c4d5e6f7a"
-	callE    = "4f8b6e95-ba5c-4d7e-9b6f-0c2d5e6f7a8b"
-	callF    = "5a9c7fa6-cb6d-4e8f-8c7a-1d3e6f7a8b9c"
-	callG    = "6bad80b7-dc7e-4f9a-9d8b-2e4f7a8b9cad"
-	callH    = "7cbe91c8-ed8f-4a0b-8e9c-3f5a8b9cadbe"
-	callI    = "8dcfa2d9-fe9a-4b1c-9fad-4a6b9cadbecf"
-	callJ    = "9ed0b3ea-0fab-4c2d-8abe-5b7cadbecfd0"
-	callK    = "afe1c4fb-1abc-4d3e-9bcf-6c8dbecfd0e1"
-	callL    = "b0f2d50c-2bcd-4e4f-8cd0-7d9ecfd0e1f2"
-	callM    = "c103e61d-3cde-4f5a-9de1-8eafd0e1f203"
-	callN    = "d214f72e-4def-4a6b-8ef2-9fb0e1f20314"
-	callO    = "e325083f-5ef0-4b7c-9f03-a0c1f2031425"
+	// Someone other than the owner, who answers, hears the greeting, and hangs up.
+	outside = "+4930123456"
+	callA   = "0b4d2a51-7c1e-4f3a-9d2b-6e8f1a2c3d4e"
+	callB   = "1c5e3b62-8d2f-4a4b-8e3c-7f9a2b3d4e5f"
+	callC   = "2d6f4c73-9e3a-4b5c-9f4d-8a0b3c4d5e6f"
+	callD   = "3e7a5d84-af4b-4c6d-8a5e-9b1c4d5e6f7a"
+	callE   = "4f8b6e95-ba5c-4d7e-9b6f-0c2d5e6f7a8b"
+	callF   = "5a9c7fa6-cb6d-4e8f-8c7a-1d3e6f7a8b9c"
+	callG   = "6bad80b7-dc7e-4f9a-9d8b-2e4f7a8b9cad"
+	callH   = "7cbe91c8-ed8f-4a0b-8e9c-3f5a8b9cadbe"
+	callI   = "8dcfa2d9-fe9a-4b1c-9fad-4a6b9cadbecf"
+	callJ   = "9ed0b3ea-0fab-4c2d-8abe-5b7cadbecfd0"
+	callK   = "afe1c4fb-1abc-4d3e-9bcf-6c8dbecfd0e1"
+	callL   = "b0f2d50c-2bcd-4e4f-8cd0-7d9ecfd0e1f2"
+	callM   = "c103e61d-3cde-4f5a-9de1-8eafd0e1f203"
+	callN   = "d214f72e-4def-4a6b-8ef2-9fb0e1f20314"
+	callO   = "e325083f-5ef0-4b7c-9f03-a0c1f2031425"
+	callP   = "f4361940-6f01-4c8d-8a14-b1d203142536"
+	callQ   = "05472a51-7a12-4d9e-9b25-c2e314253647"
 	// Longer than the second the greeting waits for the start report.
 	slowStartDelay = 1500 * time.Millisecond
 	// The start report, which the fake server logs among the call reports.
@@ -224,6 +228,12 @@ func callEvent(callID, username, to string) string {
 	return event("call", map[string]string{"callId": callID, "username": username, "to": to, "greeting": "Hi, your build finished."})
 }
 
+func outsideCallEvent(callID, username, to string) string {
+	return event("call", map[string]string{
+		"callId": callID, "username": username, "to": to, "greeting": "Hi, this is Ada, an AI assistant.", "party": "outside",
+	})
+}
+
 // phone plays the registrar and the owner's phones behind it.
 type phone struct {
 	mu      sync.Mutex
@@ -295,7 +305,7 @@ func (p *phone) ring(ctx context.Context, dialog *diago.DialogServerSession) {
 		p.ringing <- struct{}{}
 
 		waitForEnd()
-	case answers, stays:
+	case answers, stays, outside:
 		session, err := dialog.Answer(diago.AnswerOptions{})
 		if err != nil {
 			return
@@ -310,7 +320,7 @@ func (p *phone) ring(ctx context.Context, dialog *diago.DialogServerSession) {
 			p.answered <- dialog.FromUser()
 		}
 
-		if number == answers {
+		if number == answers || number == outside {
 			_ = dialog.Hangup(ctx)
 
 			return
@@ -391,6 +401,7 @@ func testConfig() *config.Config {
 			MaxDuration: time.Minute, TurnTimeout: 10 * time.Second, MaxConcurrent: 4,
 			HoldingPhrase: "One moment.", HoldingDelay: time.Minute, TimeoutPhrase: "Later.",
 			AnswerGreeting: "Hi, this is {name}.", FailurePhrase: "Sorry.", UnansweredAfter: 5 * time.Second,
+			AllowOutside: true,
 		},
 	}
 }
@@ -611,6 +622,10 @@ func TestCallsFromTheServer(t *testing.T) {
 		}
 	})
 
+	t.Run("an outside call dials its normalized number, and the number rules still refuse", func(t *testing.T) {
+		outsideCalls(t, h, owner, second)
+	})
+
 	t.Run("cancel hangs up a ringing call", func(t *testing.T) {
 		second.events <- callEvent(callC, "bea", rings)
 		h.awaitReport(callC, crumble.OutcomeRinging)
@@ -669,10 +684,55 @@ func checkCallIDs(t *testing.T, h *harness, fakeBot *bot) {
 		}
 	}
 
-	known := []string{callA, callD, callG, callJ, callK, callL, callM, callN, callO}
+	known := []string{callA, callD, callG, callJ, callK, callL, callM, callN, callO, callP}
 	for _, callID := range fakeBot.calls() {
 		if !slices.Contains(known, callID) {
 			t.Errorf("spoken message with call ID %q, want the call event's ID", callID)
+		}
+	}
+}
+
+func outsideCalls(t *testing.T, h *harness, owner *phone, open *connection) {
+	t.Helper()
+
+	open.events <- outsideCallEvent(callP, "dee", "0049 (30) 123-456")
+	if from := receive(h, owner.answered, "the outside callee heard no greeting"); from != "dee" {
+		t.Errorf("call came from %q, want the line dee", from)
+	}
+
+	h.awaitReport(callP, crumble.OutcomeEnded)
+
+	if got := h.outcomes(callP); !slices.Equal(got, []string{crumble.OutcomeRinging, start, crumble.OutcomeAnswered}) {
+		t.Errorf("call P reports = %q, want ringing, the start, then answered", got)
+	}
+
+	if dialed := owner.invitesTo(outside); dialed != 1 {
+		t.Errorf("dialed the outside number %d times, want once", dialed)
+	}
+
+	refused := []struct{ number, rule string }{
+		{"112", "5 to 15 digits"},
+		{"0900 123456", "premium, service, or satellite prefix: 0900"},
+		{"+881 234567890", "premium, service, or satellite prefix: +881"},
+		{"030 1234*56", "only digits and one leading +"},
+		{stays, "only digits and one leading +"},
+	}
+
+	for i, refusal := range refused {
+		callID := fmt.Sprintf("%s-%d", callQ, i)
+		open.events <- outsideCallEvent(callID, "dee", refusal.number)
+		got := h.awaitReport(callID, crumble.OutcomeFailed)
+
+		if !strings.Contains(got.Error, refusal.rule) {
+			t.Errorf("refusal of %q = %q, want it to name the rule %q", refusal.number, got.Error, refusal.rule)
+		}
+
+		if reports := h.outcomes(callID); !slices.Equal(reports, []string{crumble.OutcomeFailed}) {
+			t.Errorf("reports for %q = %q, want only failed", refusal.number, reports)
+		}
+
+		if dialed := owner.invitesTo(refusal.number) + owner.invitesTo(strings.ReplaceAll(refusal.number, " ", "")); dialed != 0 {
+			t.Errorf("dialed %q %d times, want never", refusal.number, dialed)
 		}
 	}
 }
@@ -755,7 +815,8 @@ func slowStart(t *testing.T, h *harness, owner *phone, open *connection) {
 	t.Helper()
 
 	drainAnswered(owner)
-	open.events <- callEvent(callO, "ada", stays)
+	// Not ada: the next test dials from that line before this call's line is free again.
+	open.events <- callEvent(callO, "bea", stays)
 	receive(h, owner.answered, "the owner heard no greeting while the start report was slow")
 
 	// The 404 on answered hangs up, which ends the call for the next test.
@@ -768,6 +829,8 @@ func slowStart(t *testing.T, h *harness, owner *phone, open *connection) {
 	if ended := receive(h, owner.ended, "the gateway kept the call the server dropped"); ended != stays {
 		t.Errorf("ended the call to %q, want the answered one", ended)
 	}
+
+	h.awaitReport(callO, crumble.OutcomeEnded)
 }
 
 func recheckAfterReconnect(t *testing.T, h *harness, owner *phone, open *connection) *connection {
@@ -879,5 +942,67 @@ func shutdownWhileRinging(t *testing.T, h *harness, owner *phone, open *connecti
 
 	if got := h.endings(callN); !slices.Equal(got, []string{crumble.ReasonStopping}) {
 		t.Errorf("call N ended = %q, want stopping, reported before Run returned", got)
+	}
+}
+
+//nolint:paralleltest // New sets the media package's port range.
+func TestOutsideCallsSwitchedOff(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	fake := &server{
+		connections: make(chan *connection, 1), reports: make(chan report, 8), lines: make(chan []lineReport, 8),
+		statuses: map[string][]int{}, slowStart: "",
+	}
+	httpServer := httptest.NewServer(fake)
+	t.Cleanup(httpServer.Close)
+
+	base, _ := url.Parse(httpServer.URL)
+	client := crumble.NewClient(base, token, httpServer.Client())
+	calls := bridge.NewCalls(client, slog.New(slog.DiscardHandler))
+
+	cfg := testConfig()
+	cfg.Call.AllowOutside = false
+
+	// The SIP gateway does not run: a call that got past the refusal would be acknowledged
+	// as ringing, and its dial would fail as not running.
+	gateway, err := sipline.New(cfg, call.Services{Speech: nil, Bot: &bot{}, Log: slog.New(slog.DiscardHandler)},
+		sipline.Options{SpeechFor: func(string) call.Speech { return nil }, StrangerRecording: nil, Calls: calls})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	h := &harness{t: t, ctx: ctx, server: fake, reports: nil}
+	bridgeDone := make(chan error, 1)
+
+	go func() { bridgeDone <- bridge.Run(ctx, gateway, client, calls, slog.New(slog.DiscardHandler)) }()
+
+	open := h.connect()
+	open.events <- configEvent("ada")
+	open.events <- outsideCallEvent(callA, "ada", outside)
+	open.events <- callEvent(callB, "ada", outside)
+
+	// Each call reports on its own goroutine, so the two reports may arrive in either order.
+	h.awaitTotal(callA, crumble.OutcomeFailed, 1)
+	h.awaitTotal(callB, crumble.OutcomeFailed, 1)
+
+	want := map[string]string{callA: sipline.ErrOutsideOff.Error(), callB: sipline.ErrNotOwner.Error()}
+	for _, got := range h.reports {
+		if got.Error != want[got.CallID] {
+			t.Errorf("call %s error = %q, want %q", got.CallID, got.Error, want[got.CallID])
+		}
+	}
+
+	// A dialed call is acknowledged as ringing before its outcome.
+	for _, callID := range []string{callA, callB} {
+		if got := h.outcomes(callID); !slices.Equal(got, []string{crumble.OutcomeFailed}) {
+			t.Errorf("call %s reports = %q, want only failed: nothing is dialed", callID, got)
+		}
+	}
+
+	cancel()
+
+	if err := <-bridgeDone; err != nil {
+		t.Errorf("Run: %v", err)
 	}
 }

@@ -73,12 +73,15 @@ func linePath(username string) string {
 	return "/v1/voice/lines/" + url.PathEscape(username)
 }
 
-// spokenRequestID is the request ID the server builds from a spoken message's IDs.
-func spokenRequestID(callID, requestID string) string {
-	return "voice:" + callID + ":" + requestID
+// answersSpoken reports whether got is the request ID the server builds from a spoken
+// message's IDs: "voice:" on a call with the owner, "outside-call:" on an outside call.
+func answersSpoken(got, callID, requestID string) bool {
+	rest := ":" + callID + ":" + requestID
+
+	return got == "voice"+rest || got == "outside-call"+rest
 }
 
-// SendSpoken posts what the owner said on a call to a line's bot. A failed attempt is
+// SendSpoken posts what was said on a call to a line's bot. A failed attempt is
 // retried with the same IDs, which the server answers with the same execution.
 func (c *Client) SendSpoken(ctx context.Context, username, callID, requestID, content string) (Execution, error) {
 	body, err := json.Marshal(map[string]string{"callId": callID, "requestId": requestID, "content": content})
@@ -99,7 +102,7 @@ func (c *Client) SendSpoken(ctx context.Context, username, callID, requestID, co
 
 		execution, retry, err := c.sendSpokenOnce(ctx, username, body)
 		if err == nil {
-			if execution.RequestID != spokenRequestID(callID, requestID) {
+			if !answersSpoken(execution.RequestID, callID, requestID) {
 				return execution, fmt.Errorf("send message: %w: answered for a different request", ErrProtocol)
 			}
 

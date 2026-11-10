@@ -217,6 +217,11 @@ func (c *conversation) loop(ctx context.Context, listened <-chan error) error {
 }
 
 func (c *conversation) handle(ctx context.Context, event speech.Event) {
+	// The bot hung up: the goodbye plays to its end and nothing the caller says starts a turn.
+	if c.leaving != nil {
+		return
+	}
+
 	switch event.Kind {
 	case speech.SpeechStarted:
 		c.session.Stop()
@@ -235,7 +240,7 @@ func (c *conversation) handle(ctx context.Context, event speech.Event) {
 // next sends everything the caller said since the last turn as one message;
 // a bot chat runs one turn at a time.
 func (c *conversation) next(ctx context.Context) {
-	if c.busy || len(c.queued) == 0 {
+	if c.busy || len(c.queued) == 0 || c.leaving != nil {
 		return
 	}
 

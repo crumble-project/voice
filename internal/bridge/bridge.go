@@ -107,6 +107,8 @@ func reportLines(ctx context.Context, gateway *sipline.Gateway, server *crumble.
 	}
 }
 
+var errUnknownParty = errors.New("the call event names a party this voice gateway does not know")
+
 // placer dials each call event's call once and reports how it went.
 type placer struct {
 	gateway *sipline.Gateway
@@ -163,7 +165,24 @@ func (p *placer) call(ctx context.Context, event crumble.VoiceCall) {
 	ringCtx, cancel := context.WithCancel(ctx)
 	call := &placed{taken: now, done: false, stop: cancel, settled: false, ringing: false}
 	p.calls[event.CallID] = call
-	owner := slices.Contains(p.owner, event.To)
+
+	outbound := sipline.Outbound{
+		CallID: event.CallID, Username: event.Username, Number: event.To, Greeting: event.Greeting, Party: sipline.PartyOwner,
+	}
+
+	var refusal error
+
+	switch event.Party {
+	case "", crumble.PartyOwner:
+	case crumble.PartyOutside:
+		outbound.Party = sipline.PartyOutside
+	default:
+		refusal = fmt.Errorf("%w: %q", errUnknownParty, event.Party)
+	}
+
+	if refusal == nil {
+		_, refusal = sipline.Dialable(outbound, p.owner, p.gateway.AllowsOutside())
+	}
 
 	go func() {
 		defer func() {
@@ -173,7 +192,7 @@ func (p *placer) call(ctx context.Context, event crumble.VoiceCall) {
 		}()
 		defer cancel()
 
-		p.place(ctx, ringCtx, call, event, owner, log)
+		p.place(ctx, ringCtx, call, outbound, refusal, log)
 	}()
 }
 
@@ -241,15 +260,16 @@ func (p *placer) cancel(callID string) {
 }
 
 // place reports under ctx, not ringCtx: a report must go out after the ringing ended.
-func (p *placer) place(ctx, ringCtx context.Context, call *placed, event crumble.VoiceCall, owner bool, log *slog.Logger) {
-	if !owner {
-		log.Warn("refused a call to a number that is not one of the owner's")
-		p.report(ctx, event.CallID, crumble.OutcomeFailed, sipline.ErrNotOwner.Error(), log)
+// A refusal reports the call failed without dialing.
+func (p *placer) place(ctx, ringCtx context.Context, call *placed, request sipline.Outbound, refusal error, log *slog.Logger) {
+	if refusal != nil {
+		log.Warn("refused the call", "error", refusal)
+		p.report(ctx, request.CallID, crumble.OutcomeFailed, refusal.Error(), log)
 
 		return
 	}
 
-	err := p.server.ReportCall(ctx, event.CallID, crumble.OutcomeRinging, "")
+	err := p.server.ReportCall(ctx, request.CallID, crumble.OutcomeRinging, "")
 	if errors.Is(err, crumble.ErrCallGone) {
 		log.Info("the server dropped the call before it was dialed")
 
@@ -271,9 +291,7 @@ func (p *placer) place(ctx, ringCtx context.Context, call *placed, event crumble
 	call.ringing = true
 	p.mu.Unlock()
 
-	hangup, err := p.gateway.Dial(ringCtx, sipline.Outbound{
-		CallID: event.CallID, Username: event.Username, Number: event.To, Greeting: event.Greeting,
-	})
+	hangup, err := p.gateway.Dial(ringCtx, request)
 
 	p.mu.Lock()
 	call.ringing = false
@@ -301,7 +319,7 @@ func (p *placer) place(ctx, ringCtx context.Context, call *placed, event crumble
 	if err == nil {
 		// An answered report that overtakes the start makes the server forget the call was
 		// the bot's, so the start then records an inbound call without the greeting.
-		p.state.awaitStart(ctx, event.CallID)
+		p.state.awaitStart(ctx, request.CallID)
 	}
 
 	outcome, detail := outcomeOf(err)
@@ -309,7 +327,7 @@ func (p *placer) place(ctx, ringCtx context.Context, call *placed, event crumble
 		log.Warn("call failed", "error", err)
 	}
 
-	if p.report(ctx, event.CallID, outcome, detail, log) && outcome == crumble.OutcomeAnswered {
+	if p.report(ctx, request.CallID, outcome, detail, log) && outcome == crumble.OutcomeAnswered {
 		p.mu.Lock()
 		call.settled = true
 		p.mu.Unlock()

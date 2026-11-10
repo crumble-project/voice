@@ -84,13 +84,14 @@ type LineState struct {
 	Error      string
 }
 
-// Outbound is a call the server asked for: the line to call from, the owner number
-// to dial, what the bot says when answered, and the call ID of its spoken messages.
+// Outbound is a call the server asked for: the line to call from, the number to dial,
+// what the bot says when answered, the call ID of its spoken messages, and who it goes to.
 type Outbound struct {
 	CallID   string
 	Username string
 	Number   string
 	Greeting string
+	Party    Party
 }
 
 const noAccount = "no SIP account with this username in sip.accounts"
@@ -287,20 +288,21 @@ func (g *Gateway) Run(ctx context.Context) error {
 	return nil
 }
 
-// Dial calls one of the owner's numbers from a line and returns once the call is
-// answered; the conversation then runs in the background until hangup is called or it ends.
+// Dial calls one of the owner's numbers, or with call.allowOutside a number that passes
+// OutsideNumber, from a line and returns once the call is answered; the conversation
+// then runs in the background until hangup is called or it ends.
 // Ending ctx before the answer cancels the call.
 //
 //nolint:contextcheck // The conversation runs under Run's context, not the event that placed the call.
 func (g *Gateway) Dial(ctx context.Context, request Outbound) (func(), error) {
-	line, parent, err := g.claimLine(request)
+	line, number, parent, err := g.claimLine(request)
 	if err != nil {
 		return nil, err
 	}
 
 	botID := line.BotID
 
-	recipient := sip.Uri{User: request.Number, Host: g.config.SIP.RegistrarHost, Port: g.config.SIP.RegistrarPort}
+	recipient := sip.Uri{User: number, Host: g.config.SIP.RegistrarHost, Port: g.config.SIP.RegistrarPort}
 	from := &sip.FromHeader{
 		DisplayName: line.DisplayName,
 		Address:     sip.Uri{User: line.Username, Host: g.config.SIP.RegistrarHost},
@@ -310,16 +312,27 @@ func (g *Gateway) Dial(ctx context.Context, request Outbound) (func(), error) {
 	ringCtx, cancel := context.WithTimeoutCause(ctx, g.config.Call.UnansweredAfter, ErrUnanswered)
 	defer cancel()
 
+	dialing := g.log.With("direction", "outbound", "call_id", request.CallID, "to", number, "line", line.Username)
+	dialing.Info("dialing")
+
 	dialog, session, err := g.diago.Invite(ringCtx, recipient, diago.InviteOptions{
 		Username: line.Username,
 		Password: line.password,
 		Headers:  []sip.Header{from},
 		RTPNAT:   media.RTPNATSymetric,
+		// Shows whether the telephone system rang the number or refused it.
+		OnResponse: func(response *sip.Response) error {
+			dialing.Info("telephone system responded", "status", response.StatusCode, "reason", response.Reason)
+
+			return nil
+		},
 	})
 	if err != nil {
 		g.release(botID)
 
 		if errors.Is(context.Cause(ringCtx), ErrUnanswered) {
+			dialing.Info("call not answered", "after", g.config.Call.UnansweredAfter.String())
+
 			return nil, ErrUnanswered
 		}
 
@@ -332,7 +345,7 @@ func (g *Gateway) Dial(ctx context.Context, request Outbound) (func(), error) {
 		return nil, fmt.Errorf("place call: %w", err)
 	}
 
-	log := g.log.With("direction", "outbound", "call", dialog.ID, "call_id", request.CallID, "to", request.Number, "bot", botID)
+	log := g.log.With("direction", "outbound", "call", dialog.ID, "call_id", request.CallID, "to", number, "bot", botID)
 	log.Info("call answered")
 
 	callCtx, stop := context.WithCancel(parent)
@@ -361,6 +374,11 @@ func (g *Gateway) Dial(ctx context.Context, request Outbound) (func(), error) {
 	<-begun
 
 	return stop, nil
+}
+
+// AllowsOutside reports whether call.allowOutside lets the gateway dial numbers that are not the owner's.
+func (g *Gateway) AllowsOutside() bool {
+	return g.config.Call.AllowOutside
 }
 
 // endCalls stops the transport and closes the SIP stack once every call hung up. sipgo
@@ -688,24 +706,27 @@ func (g *Gateway) fromRegistrar(source string) bool {
 
 // claimLine looks up the line and claims its bot under one lock, so a setup applied
 // in between cannot hand the call a bot the server no longer routes the line to.
-func (g *Gateway) claimLine(request Outbound) (localLine, context.Context, error) {
+func (g *Gateway) claimLine(request Outbound) (localLine, string, context.Context, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	line, ok := g.byUser[request.Username]
-
-	switch {
-	case !ok:
-		return line, nil, ErrUnknownLine
-	case !slices.Contains(g.owner, request.Number):
-		return line, nil, ErrNotOwner
-	case g.ctx == nil:
-		return line, nil, ErrNotRunning
-	case !g.claimLocked(line.BotID):
-		return line, nil, ErrBusy
+	if !ok {
+		return line, "", nil, ErrUnknownLine
 	}
 
-	return line, g.ctx, nil
+	number, err := Dialable(request, g.owner, g.config.Call.AllowOutside)
+
+	switch {
+	case err != nil:
+		return line, "", nil, err
+	case g.ctx == nil:
+		return line, "", nil, ErrNotRunning
+	case !g.claimLocked(line.BotID):
+		return line, "", nil, ErrBusy
+	}
+
+	return line, number, g.ctx, nil
 }
 
 type admission int

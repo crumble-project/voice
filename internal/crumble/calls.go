@@ -49,12 +49,20 @@ const (
 // The server measures its limits in JavaScript string length, UTF-16 code units.
 const maxReportError = 500
 
-// VoiceCall is a bot's request to call the owner from a line.
+// The parties of a call event. A call event without a party is a call to the owner.
+const (
+	PartyOwner   = "owner"
+	PartyOutside = "outside"
+)
+
+// VoiceCall is a bot's request to call from a line: the owner, or with Party PartyOutside
+// someone the owner approved.
 type VoiceCall struct {
 	CallID   string `json:"callId"`
 	Username string `json:"username"`
 	To       string `json:"to"`
 	Greeting string `json:"greeting"`
+	Party    string `json:"party,omitempty"`
 }
 
 // LineReport is a line's registration state as the owner's settings page shows it.

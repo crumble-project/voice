@@ -127,6 +127,9 @@ type Call struct {
 	// StrangerRecording is a WAV file played to callers who are not the owner,
 	// instead of rejecting them. Empty rejects them.
 	StrangerRecording string
+	// AllowOutside lets the server have the gateway dial numbers that are not the owner's,
+	// within the outside number rules. Off unless the file switches it on.
+	AllowOutside bool
 }
 
 type fileConfig struct {
@@ -189,6 +192,7 @@ type fileCall struct {
 	// A relative path is relative to the configuration file.
 	StrangerRecording string   `json:"strangerRecording"`
 	UnansweredAfter   duration `json:"unansweredAfter"`
+	AllowOutside      bool     `json:"allowOutside"`
 }
 
 type duration time.Duration
@@ -696,6 +700,7 @@ func (v *validator) call(raw fileCall) Call {
 		AnswerGreeting:    raw.AnswerGreeting,
 		StrangerRecording: raw.StrangerRecording,
 		UnansweredAfter:   time.Duration(raw.UnansweredAfter),
+		AllowOutside:      raw.AllowOutside,
 	}
 
 	if result.MaxDuration < time.Minute || result.MaxDuration > 4*time.Hour {

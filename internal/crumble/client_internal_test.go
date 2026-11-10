@@ -249,6 +249,21 @@ func TestTurnSettlesFromTheSpokenExecution(t *testing.T) {
 	}
 }
 
+func TestSpokenRequestIDsOfBothKindsOfCall(t *testing.T) {
+	t.Parallel()
+
+	for got, want := range map[string]bool{
+		"voice:call:request":        true,
+		"outside-call:call:request": true,
+		"voice:other:request":       false,
+		"gateway:call:request":      false,
+	} {
+		if answersSpoken(got, "call", "request") != want {
+			t.Errorf("answersSpoken(%q) = %t, want %t", got, !want, want)
+		}
+	}
+}
+
 func TestRetriedSubmissionReusesItsIDs(t *testing.T) {
 	t.Parallel()
 

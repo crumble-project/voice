@@ -280,6 +280,14 @@ func TestBotHangsUpAfterItsGoodbyeWasPlayed(t *testing.T) {
 
 	session.events <- speech.Event{Kind: speech.Utterance, Text: "please hang up"}
 
+	// What the caller says after the bot hung up starts no further turn.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+
+		session.events <- speech.Event{Kind: speech.SpeechStarted}
+		session.events <- speech.Event{Kind: speech.Utterance, Text: "hello?"}
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -293,6 +301,14 @@ func TestBotHangsUpAfterItsGoodbyeWasPlayed(t *testing.T) {
 	}, opts)
 	if !errors.Is(err, call.ErrBotHungUp) {
 		t.Fatalf("Run = %v, want the bot's hang-up", err)
+	}
+
+	bot.mu.Lock()
+	turns := len(bot.contents)
+	bot.mu.Unlock()
+
+	if turns != 1 {
+		t.Errorf("the bot got %d turns, want only the one that hung up", turns)
 	}
 
 	// The fake synthesizer makes one frame per character.

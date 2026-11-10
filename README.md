@@ -42,9 +42,27 @@ afconvert -f WAVE -d LEI16@8000 -c 1 input.m4a stranger.wav
 
 ## Calls from a bot
 
-A bot calls the owner only when its line has **Can call you** switched on in **Settings > Voice gateway**. The bot then gets a tool to place the call, and the server asks the gateway to dial the first of the owner's numbers from the bot's line. The gateway dials only a number that is among the owner's numbers in the server's current config, rings for at most `call.unansweredAfter`, says the bot's greeting when the owner answers, and reports the outcome to the server. If the server cancels the call while it rings, the gateway hangs up.
+A bot calls the owner only when its line has **Can call you** switched on in **Settings > Voice gateway**. The bot then gets a tool to place the call, and the server asks the gateway to dial the first of the owner's numbers from the bot's line. For a call to the owner, the gateway dials only a number that is among the owner's numbers in the server's current config, rings for at most `call.unansweredAfter`, says the bot's greeting when the owner answers, and reports the outcome to the server. If the server cancels the call while it rings, the gateway hangs up.
 
 To test a call, ask the bot in its chat to call you.
+
+## Outside calls
+
+An outside call is a call a bot places to someone other than the owner, after the owner approved the bot's call request in the chat. The server marks such a call event with `party` `outside`.
+
+The gateway dials outside calls only when `call.allowOutside` is `true`. It is `false` by default: the file belongs to the machine that holds the telephone account, so its operator decides whether that account may dial numbers that are not the owner's, even if the server or its token is compromised. With `call.allowOutside` off, the gateway dials nothing and reports the call failed with "outside calls are switched off on this voice gateway".
+
+With `call.allowOutside` on, the gateway still checks every outside number, with the same rules as the server, and reports a refused call as failed with the rule it broke:
+
+- It strips spaces, dashes, dots, and brackets, and turns a leading `00` into `+`. It dials the result.
+- It refuses anything that then holds a character other than digits and one leading `+`.
+- It refuses fewer than 5 or more than 15 digits, which covers 110, 112, 911, 999, and short codes.
+- It refuses German premium and service numbers (`0900`, `0137`, `0180`, `118`, and the same after `+49`), international premium numbers (`+979`), and satellite networks (`+870`, `+881`, `+882`).
+- It refuses one of the owner's numbers: an outside call must not go to the owner.
+
+The prefix list fits Germany only. The bot speaks the opening the owner approved, and the call then works like a call with the owner: turns, the chat entries, hang-up, and `call.maxDuration`. A callee who calls the line back is a stranger to the gateway.
+
+Use outside calls only to call friends and family who know about it and agreed beforehand. The legal situation for calling anyone else, including businesses, is not settled. Do not use them for advertising or sales calls.
 
 ## Calls in the bot chat
 

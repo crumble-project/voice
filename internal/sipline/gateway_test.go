@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,8 @@ const (
 	gatewayPort   = 25070
 	callerPort    = 25080
 	owner         = "**610"
+	// Someone other than the owner, whose phone the registrar answers too.
+	outsideNumber = "+4930123456"
 )
 
 type transcription struct{ events chan speech.Event }
@@ -181,6 +184,7 @@ func testConfig() *config.Config {
 			HoldingPhrase: "One moment.", HoldingDelay: time.Minute, TimeoutPhrase: "Later.",
 			AnswerGreeting: "Hi, this is {name}.",
 			FailurePhrase:  "Sorry.", UnansweredAfter: 5 * time.Second,
+			AllowOutside: true,
 		},
 	}
 }
@@ -202,6 +206,17 @@ type registrar struct {
 	unregistered chan struct{}
 	// answered receives the caller ID of each call the owner's phone took and heard audio on.
 	answered chan string
+
+	mu sync.Mutex
+	// called holds the number of every call the registrar answered.
+	called []string
+}
+
+func (r *registrar) calledNumbers() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return slices.Clone(r.called)
 }
 
 // register answers like a FRITZ!Box: ada registers, eve has a wrong password.
@@ -258,11 +273,15 @@ func startRegistrar(ctx context.Context, t *testing.T) *registrar {
 		diago.WithLogger(slog.New(slog.DiscardHandler)))
 
 	err = phone.ServeBackground(ctx, func(dialog *diago.DialogServerSession) {
-		if dialog.ToUser() != owner {
+		if dialog.ToUser() != owner && dialog.ToUser() != outsideNumber {
 			_ = dialog.Respond(sip.StatusNotFound, "Not Found", nil)
 
 			return
 		}
+
+		r.mu.Lock()
+		r.called = append(r.called, dialog.ToUser())
+		r.mu.Unlock()
 
 		session, answerErr := dialog.Answer(diago.AnswerOptions{})
 		if answerErr != nil {
@@ -411,6 +430,9 @@ func TestCalls(t *testing.T) {
 		if _, dialErr := gateway.Dial(ctx, outbound("ada", "999")); !errors.Is(dialErr, sipline.ErrNotOwner) {
 			t.Fatalf("err = %v, want ErrNotOwner", dialErr)
 		}
+	})
+	t.Run("with call.allowOutside, an outside call dials its normalized number and the number rules refuse", func(t *testing.T) {
+		botCallsOutside(ctx, t, gateway, fakeRegistrar, reports)
 	})
 	t.Run("a new config drops and adds lines", func(t *testing.T) { reconfigure(ctx, t, gateway, fakeRegistrar) })
 	t.Run("a refused line leaves the others running", func(t *testing.T) { refusedLine(ctx, t, gateway, fakeRegistrar, reports) })
@@ -593,6 +615,60 @@ func botCallsOwner(ctx context.Context, t *testing.T, gateway *sipline.Gateway, 
 func outbound(username, number string) sipline.Outbound {
 	return sipline.Outbound{
 		CallID: "6f0c7f2e-3a52-4c1e-9b8a-2d5f7c1e9a40", Username: username, Number: number, Greeting: "Hello, this is Ada.",
+		Party: sipline.PartyOwner,
+	}
+}
+
+func botCallsOutside(ctx context.Context, t *testing.T, gateway *sipline.Gateway, fakeRegistrar *registrar, reports *calls) {
+	t.Helper()
+
+	refused := []struct {
+		number string
+		err    error
+	}{
+		{"112", sipline.ErrNumberLength},
+		{"0900 1234567", sipline.ErrNumberBlocked},
+		{"+881 234567890", sipline.ErrNumberBlocked},
+		{"030 1234*56", sipline.ErrNumberCharacters},
+		{owner, sipline.ErrNumberCharacters},
+	}
+
+	for _, refusal := range refused {
+		request := outbound("ada", refusal.number)
+		request.Party = sipline.PartyOutside
+
+		if _, err := gateway.Dial(ctx, request); !errors.Is(err, refusal.err) {
+			t.Errorf("Dial(%q) err = %v, want %v", refusal.number, err, refusal.err)
+		}
+	}
+
+	before := len(fakeRegistrar.calledNumbers())
+	request := outbound("ada", "0049 (30) 123-456")
+	request.Party = sipline.PartyOutside
+
+	// The previous call releases the bot once its hangup completes.
+	deadline := time.Now().Add(5 * time.Second)
+
+	hangup, err := gateway.Dial(ctx, request)
+	for errors.Is(err, sipline.ErrBusy) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+
+		hangup, err = gateway.Dial(ctx, request)
+	}
+
+	if err != nil || hangup == nil {
+		t.Fatalf("Dial = %v", err)
+	}
+
+	next(ctx, t, reports.started, "the call start was not reported")
+	next(ctx, t, fakeRegistrar.answered, "the outside callee heard nothing")
+
+	if called := fakeRegistrar.calledNumbers()[before:]; !slices.Equal(called, []string{outsideNumber}) {
+		t.Errorf("dialed %q, want only the normalized outside number %q", called, outsideNumber)
+	}
+
+	if reason := next(ctx, t, reports.ended, "the call end was not reported"); reason != sipline.EndHungUp {
+		t.Errorf("end reason = %d, want hung up", reason)
 	}
 }
 

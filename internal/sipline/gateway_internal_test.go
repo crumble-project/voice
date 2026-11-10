@@ -2,6 +2,7 @@ package sipline
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -98,4 +99,24 @@ func TestNoCallIsAdmittedWhileStopping(t *testing.T) {
 
 	// Returns only if no refused call was added to the calls a shutdown waits for.
 	gateway.calls.Wait()
+}
+
+//nolint:paralleltest // New sets the media package's port range.
+func TestOutsideCallsSwitchedOff(t *testing.T) {
+	gateway := admitting(t)
+	gateway.ctx = context.Background()
+
+	request := Outbound{CallID: "call", Username: "ada", Number: "+4930123456", Greeting: "Hi.", Party: PartyOutside}
+	if _, _, _, err := gateway.claimLine(request); !errors.Is(err, ErrOutsideOff) {
+		t.Errorf("claimLine for an outside call = %v, want ErrOutsideOff", err)
+	}
+
+	request.Party = PartyOwner
+	if _, _, _, err := gateway.claimLine(request); !errors.Is(err, ErrNotOwner) {
+		t.Errorf("claimLine for a call without a party = %v, want ErrNotOwner", err)
+	}
+
+	if len(gateway.active) != 0 {
+		t.Errorf("claimed %d calls for refused numbers, want none", len(gateway.active))
+	}
 }

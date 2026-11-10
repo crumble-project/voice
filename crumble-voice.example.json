@@ -46,6 +46,7 @@
     "timeoutPhrase": "This is taking longer. I'll put the answer in our chat.",
     "failurePhrase": "Sorry, something went wrong. Please try again.",
     "unansweredAfter": "30s",
-    "strangerRecording": ""
+    "strangerRecording": "",
+    "allowOutside": false
   }
 }
